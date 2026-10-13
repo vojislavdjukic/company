@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"company/backend/internal/api"
+	"company/backend/internal/codex"
 	"company/backend/internal/repository"
 	"company/backend/internal/service"
 )
@@ -37,7 +38,11 @@ func main() {
 		}
 	}
 
-	app := api.NewHandler(service.NewHealthService(db))
+	// Keep one Codex client for the server lifetime so app-server remains alive
+	// across HTTP requests and can resume threads by their returned IDs.
+	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"))
+	defer codexClient.Close()
+	app := api.NewHandler(service.NewHealthService(db), codexClient)
 	server := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
 		Handler:           loggingMiddleware(app),
