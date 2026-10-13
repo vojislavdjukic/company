@@ -28,6 +28,10 @@ go.work.sum
 # env file
 .env
 
+# Build artifacts
+build/
+backend/build/
+
 # Editor/IDE
 # .idea/
 # .vscode/
