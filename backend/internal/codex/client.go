@@ -1,54 +1,64 @@
 package codex
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// Client owns one persistent Codex app-server process and its newline-delimited
-// JSON-RPC connection. A single app-server can hold many conversation threads;
-// Send serializes turns so each caller receives only its own response events.
+// Client owns one Codex app-server process and its persistent WebSocket
+// connection. Calls are serialized so each HTTP request can collect its own
+// response events without mixing them with another turn.
 type Client struct {
-	mu      sync.Mutex
-	command string
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	lines   chan []byte
-	readErr chan error
-	seq     int
-	started bool
+	mu          sync.Mutex
+	command     string
+	listenURL   string
+	cmd         *exec.Cmd
+	conn        *websocket.Conn
+	processDone chan struct{}
+	processErr  error
+	seq         int
+	started     bool
+	pending     [][]byte
 }
 
-func NewClient(command string) *Client {
-	// Allow deployments to point at a nonstandard Codex executable, while keeping
-	// the normal CLI name as the default.
+// NewClient creates a Codex client that launches app-server and connects to its
+// WebSocket listener. command is the Codex executable path (or "codex" when
+// empty); listenURL is the server bind address and client URL (or localhost
+// port 8765 when empty).
+func NewClient(command, listenURL string) *Client {
 	if command == "" {
 		command = "codex"
 	}
-	return &Client{command: command}
+	if listenURL == "" {
+		listenURL = "ws://127.0.0.1:8765"
+	}
+	return &Client{command: command, listenURL: listenURL}
 }
 
 // Send submits one user message and waits for the completed agent response.
-// An empty threadID starts a new conversation; a provided ID resumes that
-// conversation so Codex can use its earlier turns as context. The returned ID
-// must be stored by the caller and sent with the next message in that chat.
+// ctx bounds the operation, message is the user's prompt, and threadID selects
+// the conversation: empty starts a new thread; a supplied ID resumes one.
 func (c *Client) Send(ctx context.Context, message, threadID string) (string, string, error) {
+	// Only one turn may read this shared WebSocket at a time; concurrent HTTP
+	// requests wait here until the current Codex turn has completed.
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.start(); err != nil {
+	if err := c.start(ctx); err != nil {
 		return "", "", err
 	}
 	if !c.started {
 		// The app-server protocol requires one initialize handshake per process.
-		// The initialized notification confirms that the client is ready to issue
-		// normal methods such as thread/start and turn/start.
 		if _, err := c.request(ctx, "initialize", map[string]any{"clientInfo": map[string]string{
 			"name": "company_backend", "title": "Company Backend", "version": "1.0.0",
 		}}); err != nil {
@@ -62,10 +72,9 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 
 	var thread map[string]json.RawMessage
 	var err error
-	// Each message belongs to a thread. Starting one creates a new, unrelated
-	// conversation; resuming requires a valid thread ID returned by an earlier
-	// call to this endpoint.
 	if threadID == "" {
+		// A missing ID represents a new chat, while a supplied ID reconnects the
+		// caller to existing Codex history.
 		thread, err = c.request(ctx, "thread/start", map[string]any{})
 	} else {
 		thread, err = c.request(ctx, "thread/resume", map[string]any{"threadId": threadID})
@@ -74,8 +83,8 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 		return "", "", fmt.Errorf("start Codex thread: %w", err)
 	}
 	if threadID == "" {
-		// thread/start wraps its identifier in a `thread` object. Extract it so
-		// the HTTP API can return it to the caller for future requests.
+		// Return Codex's new thread ID to the API caller so it can be reused on
+		// later requests for this same chat.
 		var info struct {
 			ID string `json:"id"`
 		}
@@ -85,18 +94,26 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 		threadID = info.ID
 	}
 
-	// A thread is the conversation container; a turn is one user message and
-	// Codex's response to it. `input` is an array to match app-server's protocol.
-	if _, err := c.request(ctx, "turn/start", map[string]any{
+	// A turn is one prompt and its reply inside a thread. Keep its ID so events
+	// from any other activity on the connection cannot enter this response.
+	turn, err := c.request(ctx, "turn/start", map[string]any{
 		"threadId": threadID,
 		"input":    []map[string]string{{"type": "text", "text": message}},
-	}); err != nil {
+	})
+	if err != nil {
 		return "", threadID, fmt.Errorf("start Codex turn: %w", err)
 	}
+	var turnInfo struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(turn["turn"], &turnInfo); err != nil || turnInfo.ID == "" {
+		return "", threadID, errors.New("Codex returned no turn ID")
+	}
+
 	var response strings.Builder
 	for {
-		// Agent text arrives as incremental delta events. Accumulate it here
-		// because this HTTP endpoint returns a single JSON response after the turn.
+		// Accumulate streamed text deltas until Codex signals that this turn has
+		// finished, then return the complete text through the existing HTTP API.
 		line, err := c.next(ctx)
 		if err != nil {
 			return "", threadID, err
@@ -105,8 +122,10 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 			Method string `json:"method"`
 			ID     any    `json:"id"`
 			Params struct {
-				Delta string `json:"delta"`
-				Turn  struct {
+				TurnID string `json:"turnId"`
+				Delta  string `json:"delta"`
+				Turn   struct {
+					ID     string `json:"id"`
 					Status string `json:"status"`
 				} `json:"turn"`
 			} `json:"params"`
@@ -116,140 +135,190 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 		}
 		switch event.Method {
 		case "item/agentMessage/delta":
-			response.WriteString(event.Params.Delta)
+			if event.Params.TurnID == turnInfo.ID {
+				response.WriteString(event.Params.Delta)
+			}
 		case "turn/completed":
-			// A completion event can also describe a failed or interrupted turn.
-			// Only report success when Codex marks the turn completed.
+			if event.Params.Turn.ID != turnInfo.ID {
+				continue
+			}
 			if event.Params.Turn.Status != "completed" {
 				return "", threadID, fmt.Errorf("Codex turn %s", event.Params.Turn.Status)
 			}
 			return response.String(), threadID, nil
 		default:
 			if event.ID != nil && event.Method != "" {
-				// App-server can ask the client to approve a command or other action.
-				// This synchronous endpoint has no approval UI, so reject the request
-				// instead of leaving Codex blocked while waiting for a decision.
+				// This endpoint has no approval UI, so reject server requests that
+				// require a user decision rather than leaving the turn hanging.
 				_ = c.respondError(event.ID, "This endpoint cannot approve Codex actions")
 			}
 		}
 	}
 }
 
-func (c *Client) start() error {
-	if c.cmd != nil {
+// start launches app-server in WebSocket mode and retries the connection while
+// the listener starts accepting connections. ctx limits how long startup may
+// wait for that connection.
+func (c *Client) start(ctx context.Context) error {
+	if c.conn != nil {
 		return nil
 	}
-	// The app-server outlives an individual HTTP request. Close() owns its
-	// lifetime; binding it to the first request would kill it after that reply.
-	// stdio:// makes the process communicate over the pipes below. Keep the
-	// process alive between HTTP calls to preserve its initialized state.
-	c.cmd = exec.Command(c.command, "app-server", "--listen", "stdio://")
-	stdin, err := c.cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("open Codex stdin: %w", err)
-	}
-	stdout, err := c.cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("open Codex stdout: %w", err)
-	}
+	c.cmd = exec.Command(c.command, "app-server", "--listen", c.listenURL)
+	// App-server uses stderr for its startup banner and diagnostics; protocol
+	// traffic travels only over WebSocket, so its stdout is discarded.
+	c.cmd.Stdout = io.Discard
+	c.cmd.Stderr = os.Stderr
 	if err := c.cmd.Start(); err != nil {
 		c.cmd = nil
 		return fmt.Errorf("start Codex app-server: %w", err)
 	}
-	c.stdin, c.lines, c.readErr = stdin, make(chan []byte, 32), make(chan error, 1)
+	c.processDone = make(chan struct{})
+	// Wait separately so startup can detect an early process exit while trying
+	// to connect, and shutdown can wait until the child has been reaped.
 	go func() {
-		// JSON-RPC messages are newline-delimited. Copy each scanner buffer before
-		// the scanner reuses it, then hand messages to the request goroutine.
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 4096), 16<<20)
-		for scanner.Scan() {
-			line := append([]byte(nil), scanner.Bytes()...)
-			c.lines <- line
-		}
-		if err := scanner.Err(); err != nil {
-			c.readErr <- err
-		} else {
-			c.readErr <- io.EOF
-		}
+		c.processErr = c.cmd.Wait()
+		close(c.processDone)
 	}()
-	return nil
+
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		// The process may need a short time to bind the port after Start returns.
+		conn, _, err := dialer.DialContext(ctx, c.listenURL, http.Header{})
+		if err == nil {
+			c.conn = conn
+			return nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("connect to Codex app-server at %s: %w", c.listenURL, ctx.Err())
+		case <-c.processDone:
+			return fmt.Errorf("Codex app-server exited before WebSocket connection: %v (last dial error: %v)", c.processErr, lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
+// request sends one JSON-RPC method call and waits for its matching reply. ctx
+// bounds the wait, method is the app-server method name, and params is that
+// method's JSON object. Unrelated notifications are queued for the turn loop.
 func (c *Client) request(ctx context.Context, method string, params any) (map[string]json.RawMessage, error) {
 	c.seq++
 	id := c.seq
-	// Numeric request IDs let this client match a reply to the method call that
-	// sent it, even when app-server notifications appear between replies.
 	if err := c.write(map[string]any{"id": id, "method": method, "params": params}); err != nil {
 		return nil, err
 	}
 	for {
-		line, err := c.next(ctx)
+		line, err := c.read(ctx)
 		if err != nil {
 			return nil, err
 		}
 		var msg struct {
 			ID     *int                       `json:"id"`
+			Method string                     `json:"method"`
 			Result map[string]json.RawMessage `json:"result"`
 			Error  *struct {
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if json.Unmarshal(line, &msg) != nil || msg.ID == nil || *msg.ID != id {
+		if json.Unmarshal(line, &msg) != nil {
 			continue
 		}
-		if msg.Error != nil {
-			return nil, errors.New(msg.Error.Message)
+		if msg.ID != nil && *msg.ID == id {
+			if msg.Error != nil {
+				return nil, errors.New(msg.Error.Message)
+			}
+			return msg.Result, nil
 		}
-		return msg.Result, nil
+		// App-server can send a request as well as notifications. Reject requests
+		// that need a decision; save notifications for Send's turn event loop.
+		if msg.ID != nil && msg.Method != "" {
+			_ = c.respondError(msg.ID, "This endpoint cannot approve Codex actions")
+		} else if msg.Method != "" {
+			c.pending = append(c.pending, line)
+		}
 	}
 }
 
+// notify sends a JSON-RPC notification, which has no request ID or reply.
+// method is the app-server notification name and params is its JSON payload.
 func (c *Client) notify(method string, params any) error {
-	// Notifications have no request ID and therefore do not expect a reply.
 	return c.write(map[string]any{"method": method, "params": params})
 }
 
+// write sends one JSON object in a WebSocket text frame, the app-server's
+// WebSocket message format. value is serialized as the frame's JSON payload.
 func (c *Client) write(value any) error {
-	// One JSON object per line is the app-server stdio framing format.
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	if _, err := c.stdin.Write(data); err != nil {
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		return fmt.Errorf("write to Codex app-server: %w", err)
 	}
 	return nil
 }
 
+// next returns the next queued notification or reads a new WebSocket message.
+// ctx limits how long it waits for a message from app-server.
 func (c *Client) next(ctx context.Context) ([]byte, error) {
-	// Respect the HTTP request deadline while waiting for app-server output.
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case err := <-c.readErr:
-		return nil, fmt.Errorf("read Codex app-server: %w", err)
-	case line := <-c.lines:
+	if len(c.pending) > 0 {
+		line := c.pending[0]
+		c.pending = c.pending[1:]
 		return line, nil
 	}
+	return c.read(ctx)
 }
 
+// read applies the HTTP request deadline to the WebSocket read. AfterFunc also
+// interrupts a blocked read immediately if the caller disconnects. ctx is the
+// request context controlling the read's deadline and cancellation.
+func (c *Client) read(ctx context.Context) ([]byte, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = c.conn.SetReadDeadline(deadline)
+	} else {
+		_ = c.conn.SetReadDeadline(time.Time{})
+	}
+	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetReadDeadline(time.Now()) })
+	messageType, data, err := c.conn.ReadMessage()
+	stop()
+	_ = c.conn.SetReadDeadline(time.Time{})
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("read from Codex app-server: %w", err)
+	}
+	if messageType != websocket.TextMessage {
+		return nil, fmt.Errorf("unexpected Codex WebSocket message type %d", messageType)
+	}
+	return data, nil
+}
+
+// respondError rejects a JSON-RPC request made by app-server. id is the
+// request's correlation ID and message explains why the backend rejected it.
 func (c *Client) respondError(id any, message string) error {
 	return c.write(map[string]any{"id": id, "error": map[string]string{"message": message}})
 }
 
+// Close stops the app-server process and closes the WebSocket during backend
+// shutdown.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stdin != nil {
-		_ = c.stdin.Close()
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
 	}
 	if c.cmd != nil && c.cmd.Process != nil {
-		// The process is intentionally persistent during normal operation; stop it
-		// when the backend is shutting down.
 		_ = c.cmd.Process.Kill()
-		return c.cmd.Wait()
+		<-c.processDone
+		c.cmd = nil
+		return nil
 	}
 	return nil
 }

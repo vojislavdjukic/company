@@ -40,7 +40,7 @@ func main() {
 
 	// Keep one Codex client for the server lifetime so app-server remains alive
 	// across HTTP requests and can resume threads by their returned IDs.
-	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"))
+	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"), os.Getenv("CODEX_APP_SERVER_LISTEN"))
 	defer codexClient.Close()
 	app := api.NewHandler(service.NewHealthService(db), codexClient)
 	server := &http.Server{

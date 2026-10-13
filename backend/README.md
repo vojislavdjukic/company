@@ -31,10 +31,14 @@ curl -X POST http://localhost:4000/codex/messages \
 ```
 
 The backend starts one persistent `codex app-server` process on the first
-request. Codex must be installed and authenticated for the backend's operating
-system user. Set `CODEX_BIN` if the executable is not named `codex` or is not on
-the backend's `PATH`. Requests are serialized through this process; each waits
-up to two minutes for a completed reply.
+request and connects to it over WebSocket. Codex must be installed and
+authenticated for the backend's operating system user. Set `CODEX_BIN` if the
+executable is not named `codex` or is not on the backend's `PATH`. Set
+`CODEX_APP_SERVER_LISTEN` to change the listener address; the default is
+`ws://127.0.0.1:8765`. Keep it bound to localhost unless you configure Codex's
+WebSocket authentication. Requests are serialized through this connection;
+each waits up to two minutes for a completed reply. Codex currently describes
+the app-server WebSocket transport as experimental/unsupported.
 
 ## Layers
 

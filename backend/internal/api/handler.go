@@ -24,6 +24,8 @@ type Handler struct {
 }
 
 // NewHandler registers the public routes and returns the API HTTP handler.
+// health supplies the database check; codexService optionally handles Codex
+// prompts and responses.
 func NewHandler(health HealthService, codexService ...CodexService) http.Handler {
 	h := &Handler{health: health}
 	if len(codexService) > 0 {
@@ -44,6 +46,10 @@ type codexMessageRequest struct {
 	ThreadID string `json:"thread_id,omitempty"`
 }
 
+// Path: POST /codex/messages
+// sendCodexMessage accepts a user prompt, sends it to Codex, and returns its
+// response and conversation ID. w receives the HTTP response; r contains the
+// JSON request body and cancellation context.
 func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 	if h.codex == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Codex is unavailable"})
@@ -71,6 +77,9 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"response": response, "thread_id": threadID})
 }
 
+// Path: GET /
+// welcome returns the service name and status. w receives the HTTP response;
+// r provides the request path used to reject unmatched root paths.
 func (h *Handler) welcome(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -82,12 +91,16 @@ func (h *Handler) welcome(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// liveness reports that the process is running without depending on PostgreSQL.
+// Path: GET /healthz
+// liveness reports that the process is running without checking PostgreSQL.
+// w receives the HTTP response; the request is unused.
 func (h *Handler) liveness(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// readiness checks the database using a bounded request context.
+// Path: GET /readyz
+// readiness checks database readiness using a bounded request context. w
+// receives the HTTP response; r supplies the context for the database ping.
 func (h *Handler) readiness(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
