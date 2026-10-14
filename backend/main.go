@@ -42,7 +42,7 @@ func main() {
 	// across HTTP requests and can resume threads by their returned IDs.
 	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"), os.Getenv("CODEX_APP_SERVER_LISTEN"))
 	defer codexClient.Close()
-	app := api.NewHandler(service.NewHealthService(db), codexClient)
+	app := api.NewHandlerWithAgentRegistry(service.NewHealthService(db), codexClient, db)
 	server := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
 		Handler:           loggingMiddleware(app),

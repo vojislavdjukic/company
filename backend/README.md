@@ -18,16 +18,23 @@ By default, the app connects to the local `thecompany` database as `company` (`c
 - `POST /codex/messages` — send a message to Codex and wait for its reply
 
 The Codex endpoint accepts `{"message":"..."}` and returns the response and
-conversation ID (`thread_id`). A thread is one conversation's stored history:
-reuse its ID for each follow-up message so Codex can see earlier turns. Omit
-the ID to start a separate conversation. The backend does not associate IDs
-with users, so the calling app should store the ID alongside its own chat or
-session record.
+a three-letter `agent_name`. Send that name with follow-up messages to continue
+the same Codex thread. Omit it to start a new thread. Names are stored in
+PostgreSQL in a `codex_agent_threads` table and are global because this API does
+not currently authenticate callers.
 
 ```sh
 curl -X POST http://localhost:4000/codex/messages \
   -H 'Content-Type: application/json' \
   -d '{"message":"Summarize this project"}'
+```
+
+Example follow-up:
+
+```sh
+curl -X POST http://localhost:4000/codex/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"What are the main packages?","agent_name":"kzr"}'
 ```
 
 The backend starts one persistent `codex app-server` process on the first

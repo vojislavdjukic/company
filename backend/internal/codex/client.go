@@ -16,6 +16,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// ErrThreadNotFound indicates that a saved agent name points to a Codex thread
+// that app-server can no longer resume.
+var ErrThreadNotFound = errors.New("Codex thread not found")
+
 // Client owns one Codex app-server process and its persistent WebSocket
 // connection. Calls are serialized so each HTTP request can collect its own
 // response events without mixing them with another turn.
@@ -30,6 +34,7 @@ type Client struct {
 	seq         int
 	started     bool
 	pending     [][]byte
+	threads     map[string]struct{}
 }
 
 // NewClient creates a Codex client that launches app-server and connects to its
@@ -43,7 +48,11 @@ func NewClient(command, listenURL string) *Client {
 	if listenURL == "" {
 		listenURL = "ws://127.0.0.1:8765"
 	}
-	return &Client{command: command, listenURL: listenURL}
+	return &Client{
+		command:   command,
+		listenURL: listenURL,
+		threads:   make(map[string]struct{}),
+	}
 }
 
 // Send submits one user message and waits for the completed agent response.
@@ -80,6 +89,9 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 		thread, err = c.request(ctx, "thread/resume", map[string]any{"threadId": threadID})
 	}
 	if err != nil {
+		if threadID != "" && isMissingThreadError(err) {
+			return "", threadID, ErrThreadNotFound
+		}
 		return "", "", fmt.Errorf("start Codex thread: %w", err)
 	}
 	if threadID == "" {
@@ -93,6 +105,9 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 		}
 		threadID = info.ID
 	}
+	// Remember every thread this process has opened, including resumed threads,
+	// so Close can release its app-server subscription during shutdown.
+	c.threads[threadID] = struct{}{}
 
 	// A turn is one prompt and its reply inside a thread. Keep its ID so events
 	// from any other activity on the connection cannot enter this response.
@@ -154,6 +169,13 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 			}
 		}
 	}
+}
+
+// isMissingThreadError recognizes app-server resume errors that mean the
+// persisted thread is gone. err is the JSON-RPC error returned by app-server.
+func isMissingThreadError(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "thread not found") || strings.Contains(message, "no rollout found")
 }
 
 // start launches app-server in WebSocket mode and retries the connection while
@@ -310,7 +332,21 @@ func (c *Client) respondError(id any, message string) error {
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.conn != nil {
+	var closeErr error
+	if c.conn != nil && c.cmd != nil && c.cmd.Process != nil {
+		// Unsubscribe before closing the socket. This releases each thread's
+		// loaded session while preserving its saved conversation history.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for threadID := range c.threads {
+			if _, err := c.request(ctx, "thread/unsubscribe", map[string]any{"threadId": threadID}); err != nil {
+				closeErr = errors.Join(closeErr, fmt.Errorf("unsubscribe Codex thread %s: %w", threadID, err))
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		cancel()
+		c.threads = make(map[string]struct{})
 		_ = c.conn.Close()
 		c.conn = nil
 	}
@@ -318,7 +354,6 @@ func (c *Client) Close() error {
 		_ = c.cmd.Process.Kill()
 		<-c.processDone
 		c.cmd = nil
-		return nil
 	}
-	return nil
+	return closeErr
 }
