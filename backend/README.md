@@ -21,6 +21,7 @@ By default, the app connects to the local `thecompany` database as `company` (`c
 - `POST /codex/agents` — create a named agent, its Podman container, and an initial thread
 - `POST /codex/messages` — send a message to Codex and wait for its reply
 - `GET /codex/agents` — list the authenticated user's agent containers (admins see all)
+- `GET /codex/agents/{agent_name}/messages` — load a user's saved chat history
 - `DELETE /codex/agents/{agent_name}` — stop and permanently remove one of your agents
 
 Registration and login accept `{"email":"person@example.com","password":"..."}`.
@@ -84,7 +85,8 @@ curl -X DELETE http://localhost:4000/codex/agents/kzr \
 ```
 
 The endpoint returns `204 No Content` after removal. An agent name belonging
-to another account is treated as not found.
+to another account is treated as not found. The agent's saved chat history is
+removed with its agent mapping.
 
 List app-managed Codex containers with:
 
@@ -97,6 +99,14 @@ The response contains each visible container's ID, container name, display name,
 description, internal agent name, owner ID, status, and creation time. Regular
 users only receive their own containers; admins receive all app-managed Codex
 containers.
+
+Every prompt and completed Codex reply is stored in `codex_agent_messages`.
+Load a conversation by selecting its internal `agent_name`:
+
+```sh
+curl http://localhost:4000/codex/agents/kzr/messages \
+  -H 'Authorization: Bearer <token>'
+```
 
 The backend starts one Podman container for each `(user_id, agent_name)` when
 the agent is created or first receives a message. Each container runs `codex app-server` and exposes its

@@ -48,6 +48,14 @@ type AgentMetadataRegistry interface {
 	ListAgentMetadata(context.Context, int64, bool) ([]service.AgentProfile, error)
 }
 
+// AgentChatHistory persists and reads messages for an owned agent. ctx bounds
+// database work; userID scopes ownership; agentName identifies the chat; role
+// selects the speaker; content is the message text.
+type AgentChatHistory interface {
+	SaveAgentMessage(context.Context, int64, string, string, string) (service.AgentMessage, error)
+	ListAgentMessages(context.Context, int64, string) ([]service.AgentMessage, error)
+}
+
 // AgentLifecycleRegistry checks ownership and removes an agent's saved mapping.
 // ctx bounds database work; userID owns the agent; agentName identifies it.
 type AgentLifecycleRegistry interface {
@@ -119,6 +127,7 @@ func NewHandlerWithServices(health HealthService, codexClient any, agents AgentR
 	mux.HandleFunc("POST /codex/messages", h.sendCodexMessage)
 	mux.HandleFunc("POST /codex/agents", h.createCodexAgent)
 	mux.HandleFunc("GET /codex/agents", h.listCodexAgents)
+	mux.HandleFunc("GET /codex/agents/{agent_name}/messages", h.listCodexAgentMessages)
 	mux.HandleFunc("DELETE /codex/agents/{agent_name}", h.deleteCodexAgent)
 	mux.HandleFunc("POST /auth/register", h.register)
 	mux.HandleFunc("POST /auth/login", h.login)
@@ -321,6 +330,48 @@ type codexMessageRequest struct {
 	AgentName string `json:"agent_name,omitempty"`
 }
 
+// Path: GET /codex/agents/{agent_name}/messages
+// listCodexAgentMessages returns one owned agent's messages in send order. w
+// receives the history; r supplies the bearer token and three-letter alias.
+func (h *Handler) listCodexAgentMessages(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if !ok {
+		return
+	}
+	agentName := strings.ToLower(strings.TrimSpace(r.PathValue("agent_name")))
+	if !validAgentName(agentName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent_name must be three letters"})
+		return
+	}
+	registry, ok := h.agents.(AgentLifecycleRegistry)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent registry is unavailable"})
+		return
+	}
+	history, ok := h.agents.(AgentChatHistory)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "chat history is unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	exists, err := registry.HasAgent(ctx, user.ID, agentName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent: " + err.Error()})
+		return
+	}
+	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent not found"})
+		return
+	}
+	messages, err := history.ListAgentMessages(ctx, user.ID, agentName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "load chat history: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"agent_name": agentName, "messages": messages})
+}
+
 // Path: POST /codex/messages
 // sendCodexMessage accepts a prompt and optional agent name, sends it to Codex,
 // and returns the response and resolved name. w receives the HTTP response; r
@@ -384,7 +435,21 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent name allocator is unavailable"})
 		return
 	}
-	if agentName == "" || threadID == "" {
+	reserveGeneratedName := agentName == ""
+	if agentName != "" && threadID == "" {
+		lifecycle, canCheckAgent := h.agents.(AgentLifecycleRegistry)
+		if !canCheckAgent {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent registry is unavailable"})
+			return
+		}
+		exists, existsErr := lifecycle.HasAgent(ctx, user.ID, agentName)
+		if existsErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent name: " + existsErr.Error()})
+			return
+		}
+		reserveGeneratedName = !exists
+	}
+	if reserveGeneratedName {
 		reservedName, reserveErr := allocator.ReserveAgentName(ctx, user.ID)
 		if reserveErr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reserve agent name: " + reserveErr.Error()})
@@ -393,6 +458,15 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		agentName = reservedName
 		threadID = ""
 	}
+	history, canStoreHistory := h.agents.(AgentChatHistory)
+	if !canStoreHistory {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "chat history is unavailable"})
+		return
+	}
+	if _, err := history.SaveAgentMessage(ctx, user.ID, agentName, "user", request.Message); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store user message: " + err.Error()})
+		return
+	}
 	needsThreadSave := threadID == ""
 	staleThreadID := ""
 	response, resultThreadID, err := managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, threadID, developerInstructions)
@@ -400,6 +474,12 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		needsThreadSave = true
 		staleThreadID = threadID
 		response, resultThreadID, err = managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, "", developerInstructions)
+	}
+	if err == nil {
+		if _, storeErr := history.SaveAgentMessage(ctx, user.ID, agentName, "assistant", response); storeErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store Codex reply: " + storeErr.Error(), "agent_name": agentName})
+			return
+		}
 	}
 	if resultThreadID != "" && needsThreadSave {
 		var registryErr error

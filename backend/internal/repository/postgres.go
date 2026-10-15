@@ -417,11 +417,69 @@ func (p *Postgres) ensureAgentThreadTable(ctx context.Context) error {
 	if err == nil {
 		_, err = p.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS codex_agent_threads_user_name_unique ON codex_agent_threads (user_id, lower(display_name)) WHERE display_name <> ''`)
 	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `
+			CREATE TABLE IF NOT EXISTS codex_agent_messages (
+				id BIGSERIAL PRIMARY KEY,
+				user_id BIGINT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+				agent_name TEXT NOT NULL REFERENCES codex_agent_threads(agent_name) ON DELETE CASCADE,
+				role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+				content TEXT NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+			)`)
+	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS codex_agent_messages_chat_order ON codex_agent_messages (user_id, agent_name, id)`)
+	}
 	if err != nil {
 		return fmt.Errorf("create Codex agent mapping table: %w", err)
 	}
 	p.agentTableReady = true
 	return nil
+}
+
+// SaveAgentMessage persists one user or assistant message for an owned agent.
+// ctx bounds the insert; userID and agentName identify the chat; role is the
+// speaker; content is the complete message text.
+func (p *Postgres) SaveAgentMessage(ctx context.Context, userID int64, agentName, role, content string) (service.AgentMessage, error) {
+	if role != "user" && role != "assistant" {
+		return service.AgentMessage{}, errors.New("message role must be user or assistant")
+	}
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return service.AgentMessage{}, err
+	}
+	var message service.AgentMessage
+	err := p.db.QueryRowContext(ctx, `
+		INSERT INTO codex_agent_messages (user_id, agent_name, role, content)
+		SELECT user_id, agent_name, $3, $4 FROM codex_agent_threads
+		WHERE user_id = $1 AND agent_name = $2
+		RETURNING id, role, content, created_at`, userID, agentName, role, content).
+		Scan(&message.ID, &message.Role, &message.Content, &message.CreatedAt)
+	return message, err
+}
+
+// ListAgentMessages returns the ordered message history for an owned agent.
+// ctx bounds the query; userID scopes the account; agentName identifies its chat.
+func (p *Postgres) ListAgentMessages(ctx context.Context, userID int64, agentName string) ([]service.AgentMessage, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := p.db.QueryContext(ctx, `
+		SELECT id, role, content, created_at FROM codex_agent_messages
+		WHERE user_id = $1 AND agent_name = $2 ORDER BY id`, userID, agentName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	messages := make([]service.AgentMessage, 0)
+	for rows.Next() {
+		var message service.AgentMessage
+		if err := rows.Scan(&message.ID, &message.Role, &message.Content, &message.CreatedAt); err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
+	return messages, rows.Err()
 }
 
 // generateAgentName returns a uniformly sampled three-letter lowercase name.

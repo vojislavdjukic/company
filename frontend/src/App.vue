@@ -7,6 +7,7 @@ const agents = ref([])
 const selectedAgent = ref('')
 const selectedAgentProfile = computed(() => agents.value.find((agent) => agent.agent_name === selectedAgent.value))
 const messages = ref([])
+const loadingHistory = ref(false)
 const prompt = ref('')
 const email = ref('')
 const password = ref('')
@@ -41,11 +42,44 @@ async function loadWorkspace() {
     user.value = await api('/auth/me')
     const result = await api('/codex/agents')
     agents.value = result.containers || []
-    if (!selectedAgent.value && agents.value.length) selectedAgent.value = agents.value[0].agent_name
+    if (!selectedAgent.value && agents.value.length) {
+      selectedAgent.value = agents.value[0].agent_name
+      await loadAgentHistory(selectedAgent.value)
+    }
   } catch (requestError) {
     if (requestError.message.includes('token') || requestError.message.includes('bearer')) signOut()
     error.value = requestError.message
   }
+}
+
+/**
+ * Loads and displays the persisted conversation for one selected agent.
+ * agentName is the server's three-letter ID used to address that chat.
+ */
+async function loadAgentHistory(agentName) {
+  loadingHistory.value = true
+  messages.value = []
+  error.value = ''
+  try {
+    const result = await api(`/codex/agents/${agentName}/messages`)
+    if (selectedAgent.value === agentName) {
+      messages.value = (result.messages || []).map((message) => ({ role: message.role, text: message.content }))
+    }
+  } catch (requestError) {
+    if (selectedAgent.value === agentName) error.value = requestError.message
+  } finally {
+    loadingHistory.value = false
+  }
+}
+
+/**
+ * Selects an agent and restores its saved chat history.
+ * agentName is the internal short ID of the chosen agent.
+ */
+async function openAgent(agentName) {
+  selectedAgent.value = agentName
+  prompt.value = ''
+  await loadAgentHistory(agentName)
 }
 
 /**
@@ -97,8 +131,8 @@ async function createAgent() {
       method: 'POST',
       body: JSON.stringify({ name: newAgentName.value.trim(), description: newAgentDescription.value.trim() }),
     })
-    await loadWorkspace()
     selectedAgent.value = result.agent_name
+    await loadWorkspace()
     messages.value = []
     showAgentForm.value = false
     newAgentName.value = ''
@@ -194,7 +228,7 @@ onMounted(() => {
       <button class="new-agent button" :disabled="busy" @click="showAgentForm = true"><span>＋</span> New agent</button>
       <div class="side-label agents-label">YOUR AGENTS <span>{{ agents.length }}</span></div>
       <div class="agent-list">
-        <button v-for="agent in agents" :key="agent.agent_name" class="agent-item" :class="{ active: selectedAgent === agent.agent_name }" @click="selectedAgent = agent.agent_name; messages = []; error = ''">
+        <button v-for="agent in agents" :key="agent.agent_name" class="agent-item" :class="{ active: selectedAgent === agent.agent_name }" :disabled="busy || loadingHistory" @click="openAgent(agent.agent_name)">
           <span class="agent-avatar">{{ agent.agent_name?.slice(0, 1).toUpperCase() }}</span>
           <span class="agent-copy"><strong>{{ agent.display_name || `Agent ${agent.agent_name}` }}</strong><small>{{ agent.status }}</small></span>
           <span class="status-dot"></span>
@@ -211,7 +245,8 @@ onMounted(() => {
       </header>
 
       <div class="conversation" :class="{ 'has-messages': messages.length }">
-        <template v-if="messages.length">
+        <div v-if="loadingHistory" class="history-loading">Loading conversation…</div>
+        <template v-else-if="messages.length">
           <div v-for="(message, index) in messages" :key="index" class="message-row" :class="message.role">
             <div class="message-avatar">{{ message.role === 'user' ? user.email?.slice(0, 1).toUpperCase() : 'C' }}</div>
             <div class="message-body"><div class="message-author">{{ message.role === 'user' ? 'You' : (selectedAgentProfile?.display_name || `Agent ${selectedAgent}`) }}</div><p>{{ message.text }}</p></div>
@@ -230,7 +265,7 @@ onMounted(() => {
 
       <div class="composer-wrap">
         <p v-if="error" class="error composer-error">{{ error }}</p>
-        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy || !selectedAgent" :placeholder="selectedAgent ? 'Message your agent…' : 'Create an agent to start a conversation'" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || !selectedAgent || !prompt.trim()" aria-label="Send message">↑</button></div></form>
+        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy || loadingHistory || !selectedAgent" :placeholder="selectedAgent ? 'Message your agent…' : 'Create an agent to start a conversation'" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || loadingHistory || !selectedAgent || !prompt.trim()" aria-label="Send message">↑</button></div></form>
         <div class="disclaimer">Codex can make mistakes. Review important work before you ship it.</div>
       </div>
     </section>

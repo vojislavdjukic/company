@@ -158,6 +158,31 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	if secondMessage.Response == "" || secondMessage.Agent != firstMessage.Agent {
 		t.Fatalf("second message did not continue the first agent: %+v", secondMessage)
 	}
+	historyRequest, err := http.NewRequest(http.MethodGet, server.URL+"/codex/agents/"+agentName+"/messages", nil)
+	if err != nil {
+		t.Fatalf("create chat history request: %v", err)
+	}
+	historyRequest.Header.Set("Authorization", "Bearer "+login.Token)
+	historyResponse, err := client.Do(historyRequest)
+	if err != nil {
+		t.Fatalf("load chat history: %v", err)
+	}
+	var history struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	decodeErr := json.NewDecoder(historyResponse.Body).Decode(&history)
+	historyResponse.Body.Close()
+	if decodeErr != nil || historyResponse.StatusCode != http.StatusOK {
+		t.Fatalf("load chat history status = %d, decode error = %v", historyResponse.StatusCode, decodeErr)
+	}
+	if len(history.Messages) != 4 || history.Messages[0].Role != "user" ||
+		history.Messages[1].Role != "assistant" || history.Messages[2].Role != "user" ||
+		history.Messages[3].Role != "assistant" {
+		t.Fatalf("chat history did not contain both complete turns in order: %+v", history.Messages)
+	}
 
 	if firstMessage.Agent != agentName {
 		t.Fatalf("message used agent %q, want %q", firstMessage.Agent, agentName)
