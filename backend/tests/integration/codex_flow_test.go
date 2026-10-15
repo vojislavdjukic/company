@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,12 +121,20 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	var firstMessage struct {
 		Response string `json:"response"`
 		Agent    string `json:"agent_name"`
+		Error    string `json:"error"`
 	}
 	t.Log("sending first message to Codex app-server")
 	if status := postJSON(t, client, server.URL+"/codex/messages", map[string]string{
 		"message": "Reply with exactly READY. Do not use tools.", "agent_name": agentName,
 	}, login.Token, &firstMessage); status != http.StatusOK {
-		t.Fatalf("first Codex message status = %d, want %d", status, http.StatusOK)
+		podman := os.Getenv("PODMAN_BIN")
+		if podman == "" {
+			podman = "podman"
+		}
+		logsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		logs, logsErr := exec.CommandContext(logsCtx, podman, "logs", createdAgent.ContainerName).CombinedOutput()
+		cancel()
+		t.Fatalf("first Codex message status = %d, want %d (error %q; container logs error %v: %s)", status, http.StatusOK, firstMessage.Error, logsErr, strings.TrimSpace(string(logs)))
 	}
 	if firstMessage.Response == "" || len(firstMessage.Agent) != 3 {
 		t.Fatalf("first Codex response or agent name is empty: %+v", firstMessage)
