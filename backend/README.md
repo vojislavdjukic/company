@@ -22,6 +22,8 @@ By default, the app connects to the local `thecompany` database as `company` (`c
 - `POST /codex/messages` — send a message to Codex and wait for its reply
 - `GET /codex/agents` — list the authenticated user's agent containers (admins see all)
 - `GET /codex/agents/{agent_name}/messages` — load a user's saved chat history
+- `POST /codex/agents/{agent_name}/start` — explicitly start a stopped agent
+- `POST /codex/agents/{agent_name}/stop` — stop an agent's container and preserve its profile and chat
 - `DELETE /codex/agents/{agent_name}` — stop and permanently remove one of your agents
 
 Registration and login accept `{"email":"person@example.com","password":"..."}`.
@@ -87,6 +89,17 @@ curl -X DELETE http://localhost:4000/codex/agents/kzr \
 The endpoint returns `204 No Content` after removal. An agent name belonging
 to another account is treated as not found. The agent's saved chat history is
 removed with its agent mapping.
+
+Stop an agent without deleting its profile or conversation:
+
+```sh
+curl -X POST http://localhost:4000/codex/agents/kzr/stop \
+  -H 'Authorization: Bearer <token>'
+```
+
+Stopping returns `204 No Content`. Messages sent while the agent is stopped are
+rejected with `409 Conflict`; use the start endpoint to resume the container.
+Starting returns `204 No Content` and preserves the existing thread and history.
 
 List app-managed Codex containers with:
 

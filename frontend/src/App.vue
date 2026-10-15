@@ -13,6 +13,7 @@ const email = ref('')
 const password = ref('')
 const isRegistering = ref(false)
 const busy = ref(false)
+const stopping = ref(false)
 const error = ref('')
 const showAgentForm = ref(false)
 const newAgentName = ref('')
@@ -155,6 +156,10 @@ async function sendMessage() {
     showAgentForm.value = true
     return
   }
+  if (selectedAgentProfile.value?.status !== 'running') {
+    error.value = 'Start this agent before sending a message.'
+    return
+  }
   const agentName = selectedAgent.value
   messages.value.push({ role: 'user', text })
   prompt.value = ''
@@ -169,7 +174,7 @@ async function sendMessage() {
     messages.value.push({ role: 'assistant', text: result.response })
     await loadWorkspace()
   } catch (requestError) {
-    error.value = requestError.message
+    if (!stopping.value) error.value = requestError.message
   } finally {
     busy.value = false
   }
@@ -181,12 +186,49 @@ async function sendMessage() {
  */
 async function deleteAgent() {
   if (!selectedAgent.value) return
+  if (!window.confirm('Delete this agent, its container, and its chat history?')) return
   busy.value = true
   error.value = ''
   try {
     await api(`/codex/agents/${selectedAgent.value}`, { method: 'DELETE' })
     messages.value = []
     selectedAgent.value = ''
+    await loadWorkspace()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    busy.value = false
+  }
+}
+
+/**
+ * Stops the selected agent's container while keeping its profile and chat history.
+ * No parameters are required; the selected agent determines the target.
+ */
+async function stopAgent() {
+  if (!selectedAgent.value || stopping.value) return
+  stopping.value = true
+  error.value = ''
+  try {
+    await api(`/codex/agents/${selectedAgent.value}/stop`, { method: 'POST' })
+    await loadWorkspace()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    stopping.value = false
+  }
+}
+
+/**
+ * Explicitly starts the selected agent's container so it can receive messages.
+ * No parameters are required; the selected agent determines the target.
+ */
+async function startAgent() {
+  if (!selectedAgent.value || busy.value) return
+  busy.value = true
+  error.value = ''
+  try {
+    await api(`/codex/agents/${selectedAgent.value}/start`, { method: 'POST' })
     await loadWorkspace()
   } catch (requestError) {
     error.value = requestError.message
@@ -230,8 +272,8 @@ onMounted(() => {
       <div class="agent-list">
         <button v-for="agent in agents" :key="agent.agent_name" class="agent-item" :class="{ active: selectedAgent === agent.agent_name }" :disabled="busy || loadingHistory" @click="openAgent(agent.agent_name)">
           <span class="agent-avatar">{{ agent.agent_name?.slice(0, 1).toUpperCase() }}</span>
-          <span class="agent-copy"><strong>{{ agent.display_name || `Agent ${agent.agent_name}` }}</strong><small>{{ agent.status }}</small></span>
-          <span class="status-dot"></span>
+          <span class="agent-copy"><strong>{{ agent.display_name || `Agent ${agent.agent_name}` }}</strong><small>{{ agent.status === 'running' ? 'Running' : 'Stopped' }}</small></span>
+          <span class="status-dot" :class="{ stopped: agent.status !== 'running' }"></span>
         </button>
         <p v-if="!agents.length" class="empty-agents">Your agents will show up here.</p>
       </div>
@@ -241,7 +283,7 @@ onMounted(() => {
     <section class="chat-area">
       <header class="topbar">
         <div class="crumb"><span>Agents</span><b>/</b><strong>{{ selectedAgentProfile?.display_name || (selectedAgent ? `Agent ${selectedAgent}` : 'New conversation') }}</strong></div>
-        <div class="top-actions"><span class="secure"><span></span> PRIVATE WORKSPACE</span><button v-if="selectedAgent" class="icon-button delete-button" title="Remove agent" :disabled="busy" @click="deleteAgent">⌫</button></div>
+        <div class="top-actions"><span class="secure"><span></span> PRIVATE WORKSPACE</span><template v-if="selectedAgent"><button v-if="selectedAgentProfile?.status === 'running'" class="button stop-button" :disabled="stopping" @click="stopAgent">{{ stopping ? 'Stopping…' : 'Stop' }}</button><button v-else class="button start-button" :disabled="busy" @click="startAgent">{{ busy ? 'Starting…' : 'Start agent' }}</button><button class="button delete-button" :disabled="busy || stopping" @click="deleteAgent">Delete agent</button></template></div>
       </header>
 
       <div class="conversation" :class="{ 'has-messages': messages.length }">
@@ -256,7 +298,7 @@ onMounted(() => {
         <div v-else class="welcome">
           <div class="welcome-icon"><span>✳</span></div>
           <div class="eyebrow">{{ selectedAgent ? (selectedAgentProfile?.display_name || `YOUR AGENT · ${selectedAgent.toUpperCase()}`) : 'YOUR AI WORKSPACE' }}</div>
-          <h1>{{ selectedAgent ? 'What are we working on?' : 'Make room for a<br /><em>brilliant idea.</em>' }}</h1>
+          <h1>{{ selectedAgent ? 'What are we working on?' : 'Make room for a brilliant idea.' }}</h1>
           <p>{{ selectedAgent ? 'Share a goal, ask a question, or give your agent a task.' : 'Start a conversation with an agent. It will have its own dedicated workspace.' }}</p>
           <button v-if="!selectedAgent" class="button primary" :disabled="busy" @click="showAgentForm = true">＋ Create your first agent</button>
           <div v-else class="suggestions"><button @click="prompt = 'Help me plan my next project'">✳ &nbsp; Help me plan a project</button><button @click="prompt = 'What can you help me with?'">↗ &nbsp; Explore what you can do</button></div>
@@ -265,7 +307,7 @@ onMounted(() => {
 
       <div class="composer-wrap">
         <p v-if="error" class="error composer-error">{{ error }}</p>
-        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy || loadingHistory || !selectedAgent" :placeholder="selectedAgent ? 'Message your agent…' : 'Create an agent to start a conversation'" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || loadingHistory || !selectedAgent || !prompt.trim()" aria-label="Send message">↑</button></div></form>
+        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy || stopping || loadingHistory || !selectedAgent || selectedAgentProfile?.status !== 'running'" :placeholder="!selectedAgent ? 'Create an agent to start a conversation' : selectedAgentProfile?.status === 'running' ? 'Message your agent…' : 'Start the agent to send a message'" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || stopping || loadingHistory || !selectedAgent || selectedAgentProfile?.status !== 'running' || !prompt.trim()" aria-label="Send message">↑</button></div></form>
         <div class="disclaimer">Codex can make mistakes. Review important work before you ship it.</div>
       </div>
     </section>

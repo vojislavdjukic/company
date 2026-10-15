@@ -18,6 +18,9 @@ import (
 	"time"
 )
 
+// ErrAgentStopped means an agent must be explicitly started before it can run a turn.
+var ErrAgentStopped = errors.New("agent is stopped; start it before sending a message")
+
 // PodmanManager owns one Podman container and WebSocket client per app agent.
 // podman is the executable; image is the image containing the Codex CLI;
 // dataDir stores each agent's persistent Codex home; authFile supplies the
@@ -32,14 +35,16 @@ type PodmanManager struct {
 	hostGID  int
 	agents   map[string]*managedAgent
 	removed  map[string]struct{}
+	nextTurn uint64
 	closed   bool
 }
 
 // managedAgent holds the persistent container identity and its connected client.
 // name is the Podman name; client is the WebSocket session for its app-server.
 type managedAgent struct {
-	name   string
-	client *Client
+	name        string
+	client      *Client
+	turnCancels map[uint64]context.CancelFunc
 }
 
 // ContainerInfo contains the safe, user-facing fields returned for one
@@ -107,16 +112,46 @@ func NewPodmanManager(image string) (*PodmanManager, error) {
 // turn; userID and agentName select the container; message and threadID select
 // the turn; developerInstructions seed a replacement thread if history is gone.
 func (m *PodmanManager) SendAgent(ctx context.Context, userID int64, agentName, message, threadID, developerInstructions string) (string, string, error) {
-	agent, err := m.ensureAgent(ctx, userID, agentName)
+	agent, err := m.runningAgent(ctx, userID, agentName)
 	if err != nil {
 		return "", "", err
 	}
-	return agent.client.Send(ctx, message, threadID, developerInstructions)
+	turnCtx, cancel := context.WithCancel(ctx)
+	m.mu.Lock()
+	if m.agents[fmt.Sprintf("%d:%s", userID, agentName)] != agent {
+		m.mu.Unlock()
+		cancel()
+		return "", "", errors.New("agent was stopped before the turn started")
+	}
+	m.nextTurn++
+	turnID := m.nextTurn
+	if agent.turnCancels == nil {
+		agent.turnCancels = make(map[uint64]context.CancelFunc)
+	}
+	agent.turnCancels[turnID] = cancel
+	m.mu.Unlock()
+	response, resultThreadID, sendErr := agent.client.Send(turnCtx, message, threadID, developerInstructions)
+	m.mu.Lock()
+	delete(agent.turnCancels, turnID)
+	wasStopped := turnCtx.Err() != nil || m.agents[fmt.Sprintf("%d:%s", userID, agentName)] != agent
+	m.mu.Unlock()
+	cancel()
+	if wasStopped {
+		return "", resultThreadID, context.Canceled
+	}
+	return response, resultThreadID, sendErr
 }
 
 // EnsureAgent creates and connects an agent's container without sending a
 // prompt. ctx bounds startup; userID and agentName choose its isolated container.
 func (m *PodmanManager) EnsureAgent(ctx context.Context, userID int64, agentName string) error {
+	_, err := m.ensureAgent(ctx, userID, agentName)
+	return err
+}
+
+// StartAgent starts or reconnects one user's container without sending a turn.
+// ctx bounds startup; userID and agentName identify the agent to run.
+func (m *PodmanManager) StartAgent(ctx context.Context, userID int64, agentName string) error {
 	_, err := m.ensureAgent(ctx, userID, agentName)
 	return err
 }
@@ -166,6 +201,43 @@ func (m *PodmanManager) ensureAgent(ctx context.Context, userID int64, agentName
 	return agent, nil
 }
 
+// runningAgent returns a connected running agent and never starts its container.
+// ctx bounds inspection and connection; userID and agentName select the agent.
+func (m *PodmanManager) runningAgent(ctx context.Context, userID int64, agentName string) (*managedAgent, error) {
+	if !isThreeLetterAgentName(agentName) {
+		return nil, errors.New("agent name must contain three letters")
+	}
+	key := fmt.Sprintf("%d:%s", userID, agentName)
+	name := fmt.Sprintf("thecomp-u%d-%s", userID, agentName)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, errors.New("Podman Codex manager is closed")
+	}
+	if _, wasRemoved := m.removed[key]; wasRemoved {
+		return nil, errors.New("agent has been removed")
+	}
+	if agent := m.agents[key]; agent != nil {
+		return agent, nil
+	}
+	running, err := m.podmanOutput(ctx, "inspect", "--format", "{{.State.Running}}", name)
+	if err != nil {
+		if isContainerMissing(err) {
+			return nil, ErrAgentStopped
+		}
+		return nil, fmt.Errorf("inspect Podman Codex container %s: %w", name, err)
+	}
+	if strings.TrimSpace(running) != "true" {
+		return nil, ErrAgentStopped
+	}
+	agent, err := m.startAgent(ctx, userID, agentName)
+	if err != nil {
+		return nil, err
+	}
+	m.agents[key] = agent
+	return agent, nil
+}
+
 // RemoveAgent stops and removes one user's container and persistent Codex home.
 // ctx bounds Podman commands; userID and agentName select the container and data.
 func (m *PodmanManager) RemoveAgent(ctx context.Context, userID int64, agentName string) error {
@@ -192,6 +264,43 @@ func (m *PodmanManager) RemoveAgent(ctx context.Context, userID int64, agentName
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close Codex connection for removed agent %s: %w", name, closeErr)
+	}
+	return nil
+}
+
+// StopAgent stops one user's container but preserves its Codex home and thread.
+// ctx bounds Podman commands; userID and agentName select the container and client.
+func (m *PodmanManager) StopAgent(ctx context.Context, userID int64, agentName string) error {
+	if !isThreeLetterAgentName(agentName) {
+		return errors.New("agent name must contain three letters")
+	}
+	key := fmt.Sprintf("%d:%s", userID, agentName)
+	name := fmt.Sprintf("thecomp-u%d-%s", userID, agentName)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return errors.New("Podman Codex manager is closed")
+	}
+	agent := m.agents[key]
+	if agent != nil {
+		for _, cancelTurn := range agent.turnCancels {
+			cancelTurn()
+		}
+	}
+	running, err := m.podmanOutput(ctx, "inspect", "--format", "{{.State.Running}}", name)
+	if err != nil && !isContainerMissing(err) {
+		return fmt.Errorf("inspect Podman Codex container %s: %w", name, err)
+	}
+	if err == nil && strings.TrimSpace(running) == "true" {
+		if _, err := m.podmanOutput(ctx, "stop", "--time", "0", name); err != nil && !isContainerMissing(err) {
+			return fmt.Errorf("stop Podman Codex container %s: %w", name, err)
+		}
+	}
+	if agent != nil {
+		delete(m.agents, key)
+		if err := agent.client.Close(); err != nil {
+			return fmt.Errorf("close Codex connection for stopped agent %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -224,9 +333,9 @@ func (m *PodmanManager) ListAgents(ctx context.Context, userID int64, isAdmin bo
 		if !isThreeLetterAgentName(agentName) || len(item.Names) == 0 {
 			continue
 		}
-		status := item.State
-		if status == "" {
-			status = item.Status
+		status := strings.ToLower(item.State)
+		if status != "running" {
+			status = "stopped"
 		}
 		containers = append(containers, ContainerInfo{
 			ID: item.ID, Name: item.Names[0], AgentName: agentName,
@@ -326,7 +435,7 @@ func (m *PodmanManager) startAgent(ctx context.Context, userID int64, agentName 
 		}
 		return nil, fmt.Errorf("connect to Codex app-server in %s: %w", name, err)
 	}
-	return &managedAgent{name: name, client: client}, nil
+	return &managedAgent{name: name, client: client, turnCancels: make(map[uint64]context.CancelFunc)}, nil
 }
 
 // agentWebSocketToken loads or creates a per-agent app-server transport token.
