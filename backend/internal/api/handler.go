@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"company/backend/internal/codex"
+	"company/backend/internal/service"
 )
 
 // HealthService exposes the readiness check needed by HTTP handlers.
@@ -25,9 +26,16 @@ type CodexService interface {
 // database operation; names are three lowercase letters and thread IDs are
 // returned by Codex or persisted in PostgreSQL.
 type AgentRegistry interface {
-	LookupAgentThread(context.Context, string) (string, error)
-	CreateAgentThread(context.Context, string) (string, error)
-	ReplaceAgentThread(context.Context, string, string, string) (string, error)
+	LookupAgentThread(context.Context, int64, string) (string, error)
+	CreateAgentThread(context.Context, int64, string) (string, error)
+	ReplaceAgentThread(context.Context, int64, string, string, string) (string, error)
+}
+
+// AccountService performs account registration, login, and bearer-token validation.
+type AccountService interface {
+	Register(context.Context, string, string) (service.User, string, error)
+	Login(context.Context, string, string) (service.User, string, error)
+	Authenticate(context.Context, string) (service.User, error)
 }
 
 // Handler maps HTTP requests to application services and formats responses.
@@ -35,6 +43,7 @@ type Handler struct {
 	health HealthService
 	codex  CodexService
 	agents AgentRegistry
+	auth   AccountService
 }
 
 // NewHandler registers the public routes and returns the API HTTP handler.
@@ -52,12 +61,21 @@ func NewHandler(health HealthService, codexService ...CodexService) http.Handler
 // name dependencies. health checks PostgreSQL; codexClient sends prompts;
 // agents persist short-name-to-thread-ID mappings.
 func NewHandlerWithAgentRegistry(health HealthService, codexClient CodexService, agents AgentRegistry) http.Handler {
-	h := &Handler{health: health, codex: codexClient, agents: agents}
+	return NewHandlerWithServices(health, codexClient, agents, nil)
+}
+
+// NewHandlerWithServices builds the API with health, Codex, registry, and account services.
+// health checks readiness; codexClient sends prompts; agents persist thread aliases; auth manages accounts.
+func NewHandlerWithServices(health HealthService, codexClient CodexService, agents AgentRegistry, auth AccountService) http.Handler {
+	h := &Handler{health: health, codex: codexClient, agents: agents, auth: auth}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.welcome)
 	mux.HandleFunc("GET /healthz", h.liveness)
 	mux.HandleFunc("GET /readyz", h.readiness)
 	mux.HandleFunc("POST /codex/messages", h.sendCodexMessage)
+	mux.HandleFunc("POST /auth/register", h.register)
+	mux.HandleFunc("POST /auth/login", h.login)
+	mux.HandleFunc("GET /auth/me", h.currentUser)
 	return mux
 }
 
@@ -73,6 +91,10 @@ type codexMessageRequest struct {
 // and returns the response and resolved name. w receives the HTTP response; r
 // contains the JSON request body and cancellation context.
 func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if !ok {
+		return
+	}
 	if h.codex == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Codex is unavailable"})
 		return
@@ -102,7 +124,7 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 	threadID := ""
 	if agentName != "" {
 		var err error
-		threadID, err = h.agents.LookupAgentThread(ctx, agentName)
+		threadID, err = h.agents.LookupAgentThread(ctx, user.ID, agentName)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent name: " + err.Error()})
 			return
@@ -115,7 +137,7 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		// and atomically replace the stale mapping with a newly generated name.
 		response, resultThreadID, err = h.codex.Send(ctx, request.Message, "")
 		if resultThreadID != "" {
-			newName, registryErr := h.agents.ReplaceAgentThread(ctx, agentName, threadID, resultThreadID)
+			newName, registryErr := h.agents.ReplaceAgentThread(ctx, user.ID, agentName, threadID, resultThreadID)
 			if registryErr != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "replace stale agent mapping: " + registryErr.Error()})
 				return
@@ -124,7 +146,7 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if resultThreadID != "" && threadID == "" {
 		// New conversations receive a unique generated alias for future requests.
-		newName, registryErr := h.agents.CreateAgentThread(ctx, resultThreadID)
+		newName, registryErr := h.agents.CreateAgentThread(ctx, user.ID, resultThreadID)
 		if registryErr != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store agent mapping: " + registryErr.Error()})
 			return
@@ -136,6 +158,105 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"response": response, "agent_name": agentName})
+}
+
+type credentialsRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// Path: POST /auth/register
+// register creates an account and returns its bearer token. w receives the response; r contains credentials.
+func (h *Handler) register(w http.ResponseWriter, r *http.Request) {
+	if h.auth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication is unavailable"})
+		return
+	}
+	var credentials credentialsRequest
+	if !decodeCredentials(w, r, &credentials) {
+		return
+	}
+	user, token, err := h.auth.Register(r.Context(), credentials.Email, credentials.Password)
+	if errors.Is(err, service.ErrInvalidInput) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, service.ErrEmailTaken) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "register account"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"user": user, "token": token})
+}
+
+// Path: POST /auth/login
+// login verifies credentials and returns a new bearer token. w receives the response; r contains credentials.
+func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	if h.auth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication is unavailable"})
+		return
+	}
+	var credentials credentialsRequest
+	if !decodeCredentials(w, r, &credentials) {
+		return
+	}
+	user, token, err := h.auth.Login(r.Context(), credentials.Email, credentials.Password)
+	if errors.Is(err, service.ErrInvalidCredentials) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid email or password"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "log in"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": user, "token": token})
+}
+
+// Path: GET /auth/me
+// currentUser returns the account belonging to the supplied bearer token. w receives the response; r supplies Authorization.
+func (h *Handler) currentUser(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if ok {
+		writeJSON(w, http.StatusOK, user)
+	}
+}
+
+// decodeCredentials decodes a bounded JSON credentials body. w receives any validation response; r contains the body; target receives decoded values.
+func decodeCredentials(w http.ResponseWriter, r *http.Request, target *credentialsRequest) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(target); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide valid email and password JSON"})
+		return false
+	}
+	return true
+}
+
+// authenticatedUser validates the request's Bearer token. w receives an error response when invalid; r supplies Authorization.
+func (h *Handler) authenticatedUser(w http.ResponseWriter, r *http.Request) (service.User, bool) {
+	if h.auth == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication is unavailable"})
+		return service.User{}, false
+	}
+	parts := strings.Fields(r.Header.Get("Authorization"))
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "provide a bearer token"})
+		return service.User{}, false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	user, err := h.auth.Authenticate(ctx, parts[1])
+	if err != nil {
+		if errors.Is(err, service.ErrInvalidToken) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		} else {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "authenticate bearer token"})
+		}
+		return service.User{}, false
+	}
+	return user, true
 }
 
 // validAgentName checks that name matches the lowercase three-letter aliases

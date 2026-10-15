@@ -1,0 +1,225 @@
+package integration
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strconv"
+	"testing"
+	"time"
+
+	"company/backend/internal/api"
+	"company/backend/internal/codex"
+	"company/backend/internal/repository"
+	"company/backend/internal/service"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+)
+
+const defaultIntegrationDatabaseURL = "postgres://company:company@localhost:5432/thecompany?sslmode=disable"
+
+// TestRegistrationLoginAndCodexConversation exercises account creation, login,
+// two authenticated turns on one Codex thread, and orderly server shutdown.
+// t provides test configuration and reports failures; database URL overrides are optional,
+// and Codex must be installed and authenticated for the current OS user.
+func TestRegistrationLoginAndCodexConversation(t *testing.T) {
+	databaseURL := isolatedDatabaseURL(t)
+	db, err := repository.OpenPostgres(databaseURL)
+	if err != nil {
+		t.Fatalf("open isolated database: %v", err)
+	}
+	defer db.Close()
+
+	auth, err := service.NewAuthService(db, "integration-test-signing-secret-32-bytes-minimum")
+	if err != nil {
+		t.Fatalf("create authentication service: %v", err)
+	}
+	listenURL := freeCodexListenURL(t)
+	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"), listenURL)
+	defer func() {
+		if err := codexClient.Close(); err != nil {
+			t.Errorf("close Codex app-server: %v", err)
+		}
+	}()
+
+	handler := api.NewHandlerWithServices(service.NewHealthService(db), codexClient, db, auth)
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	client := &http.Client{Timeout: 90 * time.Second}
+
+	var registration struct {
+		User struct {
+			ID    int64  `json:"id"`
+			Email string `json:"email"`
+			Role  string `json:"role"`
+		} `json:"user"`
+		Token string `json:"token"`
+	}
+	email := fmt.Sprintf("test-%d@example.test", time.Now().UnixNano())
+	t.Log("registering test user")
+	if status := postJSON(t, client, server.URL+"/auth/register", map[string]string{
+		"email": email, "password": "integration-test-password",
+	}, "", &registration); status != http.StatusCreated {
+		t.Fatalf("registration status = %d, want %d", status, http.StatusCreated)
+	}
+	if registration.User.ID == 0 || registration.User.Role != "user" || registration.Token == "" {
+		t.Fatalf("registration returned incomplete user or token: %+v", registration.User)
+	}
+
+	var login struct {
+		User struct {
+			ID   int64  `json:"id"`
+			Role string `json:"role"`
+		} `json:"user"`
+		Token string `json:"token"`
+	}
+	t.Log("logging in test user")
+	if status := postJSON(t, client, server.URL+"/auth/login", map[string]string{
+		"email": email, "password": "integration-test-password",
+	}, "", &login); status != http.StatusOK {
+		t.Fatalf("login status = %d, want %d", status, http.StatusOK)
+	}
+	if login.User.ID != registration.User.ID || login.User.Role != "user" || login.Token == "" {
+		t.Fatalf("login returned unexpected account or token: %+v", login.User)
+	}
+
+	var firstMessage struct {
+		Response string `json:"response"`
+		Agent    string `json:"agent_name"`
+	}
+	t.Log("sending first message to Codex app-server")
+	if status := postJSON(t, client, server.URL+"/codex/messages", map[string]string{
+		"message": "Reply with exactly READY. Do not use tools.",
+	}, login.Token, &firstMessage); status != http.StatusOK {
+		t.Fatalf("first Codex message status = %d, want %d", status, http.StatusOK)
+	}
+	if firstMessage.Response == "" || len(firstMessage.Agent) != 3 {
+		t.Fatalf("first Codex response or agent name is empty: %+v", firstMessage)
+	}
+
+	var secondMessage struct {
+		Response string `json:"response"`
+		Agent    string `json:"agent_name"`
+	}
+	t.Log("sending follow-up message to Codex app-server")
+	if status := postJSON(t, client, server.URL+"/codex/messages", map[string]string{
+		"message": "Reply with exactly SECOND. Do not use tools.", "agent_name": firstMessage.Agent,
+	}, login.Token, &secondMessage); status != http.StatusOK {
+		t.Fatalf("second Codex message status = %d, want %d", status, http.StatusOK)
+	}
+	if secondMessage.Response == "" || secondMessage.Agent != firstMessage.Agent {
+		t.Fatalf("second message did not continue the first agent: %+v", secondMessage)
+	}
+
+	server.Close()
+	t.Log("closing Codex app-server")
+	if err := codexClient.Close(); err != nil {
+		t.Fatalf("close Codex app-server after both turns: %v", err)
+	}
+	t.Log("Codex app-server closed")
+}
+
+// isolatedDatabaseURL creates an empty schema for the integration test and
+// returns a PostgreSQL URL whose connections use that schema as search_path.
+// t reports setup failures; INTEGRATION_TEST_DATABASE_URL optionally overrides the local default URL.
+func isolatedDatabaseURL(t *testing.T) string {
+	t.Helper()
+	databaseURL := os.Getenv("INTEGRATION_TEST_DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = os.Getenv("DATABASE_URL")
+	}
+	if databaseURL == "" {
+		databaseURL = defaultIntegrationDatabaseURL
+	}
+	adminDB, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		t.Fatalf("open integration database: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := adminDB.PingContext(ctx); err != nil {
+		adminDB.Close()
+		t.Fatalf("connect to integration database: %v", err)
+	}
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		adminDB.Close()
+		t.Fatalf("generate isolated schema name: %v", err)
+	}
+	schema := "codex_test_" + hex.EncodeToString(suffix[:])
+	if _, err := adminDB.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+		adminDB.Close()
+		t.Fatalf("create isolated schema: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		if _, err := adminDB.ExecContext(cleanupCtx, `DROP SCHEMA "`+schema+`" CASCADE`); err != nil {
+			t.Errorf("drop isolated integration schema: %v", err)
+		}
+		if err := adminDB.Close(); err != nil {
+			t.Errorf("close integration database connection: %v", err)
+		}
+	})
+	parsedURL, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatalf("parse integration database URL: %v", err)
+	}
+	query := parsedURL.Query()
+	query.Set("search_path", schema)
+	parsedURL.RawQuery = query.Encode()
+	return parsedURL.String()
+}
+
+// freeCodexListenURL reserves an available local TCP port long enough to select
+// an app-server WebSocket address. t reports socket allocation failures.
+func freeCodexListenURL(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve Codex app-server port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release temporary Codex port: %v", err)
+	}
+	return "ws://127.0.0.1:" + strconv.Itoa(port)
+}
+
+// postJSON sends value as JSON with an optional bearer token, checks transport
+// errors, decodes the response into target, and returns the HTTP status.
+// t reports failures; client performs the request; endpoint is the full URL;
+// value is the JSON body; token is optional; target receives decoded JSON.
+func postJSON(t *testing.T, client *http.Client, endpoint string, value any, token string, target any) int {
+	t.Helper()
+	body, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode request for %s: %v", endpoint, err)
+	}
+	request, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("create request for %s: %v", endpoint, err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("send request to %s: %v", endpoint, err)
+	}
+	defer response.Body.Close()
+	if err := json.NewDecoder(response.Body).Decode(target); err != nil {
+		t.Fatalf("decode response from %s: %v", endpoint, err)
+	}
+	return response.StatusCode
+}

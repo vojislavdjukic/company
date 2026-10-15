@@ -186,6 +186,7 @@ func (c *Client) start(ctx context.Context) error {
 		return nil
 	}
 	c.cmd = exec.Command(c.command, "app-server", "--listen", c.listenURL)
+	configureCommandProcessGroup(c.cmd)
 	// App-server uses stderr for its startup banner and diagnostics; protocol
 	// traffic travels only over WebSocket, so its stdout is discarded.
 	c.cmd.Stdout = io.Discard
@@ -333,27 +334,26 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var closeErr error
-	if c.conn != nil && c.cmd != nil && c.cmd.Process != nil {
-		// Unsubscribe before closing the socket. This releases each thread's
-		// loaded session while preserving its saved conversation history.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		for threadID := range c.threads {
-			if _, err := c.request(ctx, "thread/unsubscribe", map[string]any{"threadId": threadID}); err != nil {
-				closeErr = errors.Join(closeErr, fmt.Errorf("unsubscribe Codex thread %s: %w", threadID, err))
-			}
-			if ctx.Err() != nil {
-				break
-			}
+	// Closing the WebSocket and terminating app-server releases every loaded
+	// thread session. Avoid waiting for an unsubscribe response here because a
+	// server that is already stopping may never send one.
+	if c.conn != nil {
+		if err := c.conn.Close(); err != nil {
+			closeErr = errors.Join(closeErr, fmt.Errorf("close Codex WebSocket: %w", err))
 		}
-		cancel()
-		c.threads = make(map[string]struct{})
-		_ = c.conn.Close()
 		c.conn = nil
 	}
+	c.threads = make(map[string]struct{})
 	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
-		<-c.processDone
-		c.cmd = nil
+		if err := terminateCommandProcessGroup(c.cmd); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			closeErr = errors.Join(closeErr, fmt.Errorf("terminate Codex app-server: %w", err))
+		}
+		select {
+		case <-c.processDone:
+			c.cmd = nil
+		case <-time.After(5 * time.Second):
+			closeErr = errors.Join(closeErr, errors.New("timed out waiting for Codex app-server to exit"))
+		}
 	}
 	return closeErr
 }
