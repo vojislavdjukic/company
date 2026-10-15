@@ -56,7 +56,7 @@ func main() {
 	app := api.NewHandlerWithServices(service.NewHealthService(db), codexManager, db, authService)
 	server := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
-		Handler:           loggingMiddleware(app),
+		Handler:           loggingMiddleware(applicationHandler(app)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

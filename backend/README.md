@@ -142,10 +142,25 @@ go test -v ./tests/integration
 
 ## Live reload
 
-From the repository root, run Air:
+From the repository root, install the Vue dependencies once and run the
+development launcher:
 
 ```sh
-air
+npm --prefix frontend install
+./dev.sh
 ```
 
-Air builds the binary and temporary files under `backend/build/`.
+Vite serves the frontend at `http://127.0.0.1:5173` with hot module
+replacement. It proxies API calls to the Go server on port 4000. The launcher
+supervises both Vite and Air and cleans up both when stopped; Air builds the
+backend under `backend/build/` and stops its Go child on exit.
+
+Build static frontend assets before building the production backend:
+
+```sh
+npm --prefix frontend run build
+cd backend && go build ./...
+```
+
+The Go binary embeds `backend/web/dist` and serves the frontend and API from
+the same process.
