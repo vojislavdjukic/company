@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -17,9 +18,46 @@ type HealthService interface {
 	CheckDatabase(context.Context) error
 }
 
-// CodexService sends a prompt to a Codex app-server conversation.
-type CodexService interface {
-	Send(context.Context, string, string) (string, string, error)
+// AgentCodexService sends a prompt through the runtime assigned to one account
+// and agent name. userID and agentName select the runtime; message and threadID
+// identify the requested Codex turn.
+type AgentCodexService interface {
+	SendAgent(context.Context, int64, string, string, string) (string, string, error)
+}
+
+// AgentCreator starts a user's isolated container and creates its first thread.
+// ctx bounds the operation; userID owns the agent and agentName identifies it.
+type AgentCreator interface {
+	CreateAgent(context.Context, int64, string) (string, string, error)
+}
+
+// AgentNameAllocator reserves a generated agent name before its runtime starts
+// and saves the first thread ID afterward. ctx bounds the database work; userID
+// owns the generated name; threadID is returned by Codex.
+type AgentNameAllocator interface {
+	ReserveAgentName(context.Context, int64) (string, error)
+	SetAgentThread(context.Context, int64, string, string) error
+	ReplaceAgentThreadID(context.Context, int64, string, string, string) error
+}
+
+// AgentLifecycleRegistry checks ownership and removes an agent's saved mapping.
+// ctx bounds database work; userID owns the agent; agentName identifies it.
+type AgentLifecycleRegistry interface {
+	HasAgent(context.Context, int64, string) (bool, error)
+	DeleteAgent(context.Context, int64, string) (bool, error)
+}
+
+// AgentRemover stops and removes one user's agent runtime and its persistent
+// data. ctx bounds cleanup; userID and agentName select the owned agent.
+type AgentRemover interface {
+	RemoveAgent(context.Context, int64, string) error
+}
+
+// AgentLister returns the app-managed containers visible to the given account.
+// ctx bounds the Podman query; userID scopes regular users; isAdmin enables the
+// system-wide view for administrators.
+type AgentLister interface {
+	ListAgents(context.Context, int64, bool) ([]codex.ContainerInfo, error)
 }
 
 // AgentRegistry maps caller-facing names to Codex thread IDs. ctx controls the
@@ -27,8 +65,6 @@ type CodexService interface {
 // returned by Codex or persisted in PostgreSQL.
 type AgentRegistry interface {
 	LookupAgentThread(context.Context, int64, string) (string, error)
-	CreateAgentThread(context.Context, int64, string) (string, error)
-	ReplaceAgentThread(context.Context, int64, string, string, string) (string, error)
 }
 
 // AccountService performs account registration, login, and bearer-token validation.
@@ -41,7 +77,7 @@ type AccountService interface {
 // Handler maps HTTP requests to application services and formats responses.
 type Handler struct {
 	health HealthService
-	codex  CodexService
+	codex  any
 	agents AgentRegistry
 	auth   AccountService
 }
@@ -49,8 +85,8 @@ type Handler struct {
 // NewHandler registers the public routes and returns the API HTTP handler.
 // health supplies the readiness check; an optional codexService sends agent
 // prompts. Use NewHandlerWithAgentRegistry to enable named Codex conversations.
-func NewHandler(health HealthService, codexService ...CodexService) http.Handler {
-	var codexClient CodexService
+func NewHandler(health HealthService, codexService ...any) http.Handler {
+	var codexClient any
 	if len(codexService) > 0 {
 		codexClient = codexService[0]
 	}
@@ -60,23 +96,172 @@ func NewHandler(health HealthService, codexService ...CodexService) http.Handler
 // NewHandlerWithAgentRegistry constructs the API with health, Codex, and agent
 // name dependencies. health checks PostgreSQL; codexClient sends prompts;
 // agents persist short-name-to-thread-ID mappings.
-func NewHandlerWithAgentRegistry(health HealthService, codexClient CodexService, agents AgentRegistry) http.Handler {
+func NewHandlerWithAgentRegistry(health HealthService, codexClient any, agents AgentRegistry) http.Handler {
 	return NewHandlerWithServices(health, codexClient, agents, nil)
 }
 
 // NewHandlerWithServices builds the API with health, Codex, registry, and account services.
 // health checks readiness; codexClient sends prompts; agents persist thread aliases; auth manages accounts.
-func NewHandlerWithServices(health HealthService, codexClient CodexService, agents AgentRegistry, auth AccountService) http.Handler {
+func NewHandlerWithServices(health HealthService, codexClient any, agents AgentRegistry, auth AccountService) http.Handler {
 	h := &Handler{health: health, codex: codexClient, agents: agents, auth: auth}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", h.welcome)
 	mux.HandleFunc("GET /healthz", h.liveness)
 	mux.HandleFunc("GET /readyz", h.readiness)
 	mux.HandleFunc("POST /codex/messages", h.sendCodexMessage)
+	mux.HandleFunc("POST /codex/agents", h.createCodexAgent)
+	mux.HandleFunc("GET /codex/agents", h.listCodexAgents)
+	mux.HandleFunc("DELETE /codex/agents/{agent_name}", h.deleteCodexAgent)
 	mux.HandleFunc("POST /auth/register", h.register)
 	mux.HandleFunc("POST /auth/login", h.login)
 	mux.HandleFunc("GET /auth/me", h.currentUser)
 	return mux
+}
+
+// Path: POST /codex/agents
+// createCodexAgent reserves a short name, starts its container, and creates
+// the initial Codex thread. w receives the identifiers; r supplies the bearer token.
+func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if !ok {
+		return
+	}
+	if user.Role != "user" && user.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "role cannot create Codex agents"})
+		return
+	}
+	allocator, ok := h.agents.(AgentNameAllocator)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent name allocator is unavailable"})
+		return
+	}
+	registry, ok := h.agents.(AgentLifecycleRegistry)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent cleanup registry is unavailable"})
+		return
+	}
+	creator, ok := h.codex.(AgentCreator)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "container-backed Codex service is unavailable"})
+		return
+	}
+	remover, ok := h.codex.(AgentRemover)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent container cleanup is unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	agentName, err := allocator.ReserveAgentName(ctx, user.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reserve agent name: " + err.Error()})
+		return
+	}
+	rollback := func() error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cleanupCancel()
+		removeErr := remover.RemoveAgent(cleanupCtx, user.ID, agentName)
+		_, deleteErr := registry.DeleteAgent(cleanupCtx, user.ID, agentName)
+		if removeErr != nil {
+			removeErr = errors.Join(errors.New("remove failed agent container"), removeErr)
+		}
+		if deleteErr != nil {
+			deleteErr = errors.Join(errors.New("remove failed agent mapping"), deleteErr)
+		}
+		return errors.Join(removeErr, deleteErr)
+	}
+	threadID, containerName, err := creator.CreateAgent(ctx, user.ID, agentName)
+	if err != nil {
+		rollbackErr := rollback()
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": errors.Join(fmt.Errorf("create container-backed agent: %w", err), rollbackErr).Error()})
+		return
+	}
+	if err := allocator.SetAgentThread(ctx, user.ID, agentName, threadID); err != nil {
+		rollbackErr := rollback()
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": errors.Join(fmt.Errorf("store agent thread: %w", err), rollbackErr).Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"agent_name": agentName, "thread_id": threadID, "container_name": containerName,
+	})
+}
+
+// Path: GET /codex/agents
+// listCodexAgents returns managed containers visible to the authenticated
+// account. w receives the JSON list; r supplies the bearer token and context.
+func (h *Handler) listCodexAgents(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if !ok {
+		return
+	}
+	if user.Role != "user" && user.Role != "admin" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "role cannot list Codex containers"})
+		return
+	}
+	lister, ok := h.codex.(AgentLister)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "container listing is unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	containers, err := lister.ListAgents(ctx, user.ID, user.Role == "admin")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list Codex containers: " + err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"containers": containers})
+}
+
+// Path: DELETE /codex/agents/{agent_name}
+// deleteCodexAgent removes the authenticated user's agent, including its
+// container and saved thread mapping. w receives the status; r supplies the
+// agent name and authentication token.
+func (h *Handler) deleteCodexAgent(w http.ResponseWriter, r *http.Request) {
+	user, ok := h.authenticatedUser(w, r)
+	if !ok {
+		return
+	}
+	agentName := strings.ToLower(strings.TrimSpace(r.PathValue("agent_name")))
+	if !validAgentName(agentName) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agent_name must be three letters"})
+		return
+	}
+	registry, ok := h.agents.(AgentLifecycleRegistry)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent lifecycle registry is unavailable"})
+		return
+	}
+	remover, ok := h.codex.(AgentRemover)
+	if !ok {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent runtime removal is unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	exists, err := registry.HasAgent(ctx, user.ID, agentName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent: " + err.Error()})
+		return
+	}
+	if !exists {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent not found"})
+		return
+	}
+	if err := remover.RemoveAgent(ctx, user.ID, agentName); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "remove agent runtime: " + err.Error()})
+		return
+	}
+	deleted, err := registry.DeleteAgent(ctx, user.ID, agentName)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "remove agent mapping: " + err.Error()})
+		return
+	}
+	if !deleted {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "agent not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type codexMessageRequest struct {
@@ -130,28 +315,44 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	response, resultThreadID, err := h.codex.Send(ctx, request.Message, threadID)
-	if errors.Is(err, codex.ErrThreadNotFound) && agentName != "" {
-		// A saved alias can outlive a deleted thread. Start a fresh conversation
-		// and atomically replace the stale mapping with a newly generated name.
-		response, resultThreadID, err = h.codex.Send(ctx, request.Message, "")
-		if resultThreadID != "" {
-			newName, registryErr := h.agents.ReplaceAgentThread(ctx, user.ID, agentName, threadID, resultThreadID)
-			if registryErr != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "replace stale agent mapping: " + registryErr.Error()})
-				return
-			}
-			agentName = newName
-		}
-	} else if resultThreadID != "" && threadID == "" {
-		// New conversations receive a unique generated alias for future requests.
-		newName, registryErr := h.agents.CreateAgentThread(ctx, user.ID, resultThreadID)
-		if registryErr != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store agent mapping: " + registryErr.Error()})
+	managedCodex, isManaged := h.codex.(AgentCodexService)
+	allocator, canReserve := h.agents.(AgentNameAllocator)
+	if !isManaged {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "container-backed Codex service is unavailable"})
+		return
+	}
+	if !canReserve {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "agent name allocator is unavailable"})
+		return
+	}
+	if agentName == "" || threadID == "" {
+		reservedName, reserveErr := allocator.ReserveAgentName(ctx, user.ID)
+		if reserveErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reserve agent name: " + reserveErr.Error()})
 			return
 		}
-		agentName = newName
+		agentName = reservedName
+		threadID = ""
+	}
+	needsThreadSave := threadID == ""
+	staleThreadID := ""
+	response, resultThreadID, err := managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, threadID)
+	if errors.Is(err, codex.ErrThreadNotFound) && agentName != "" {
+		needsThreadSave = true
+		staleThreadID = threadID
+		response, resultThreadID, err = managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, "")
+	}
+	if resultThreadID != "" && needsThreadSave {
+		var registryErr error
+		if staleThreadID != "" {
+			registryErr = allocator.ReplaceAgentThreadID(ctx, user.ID, agentName, staleThreadID, resultThreadID)
+		} else {
+			registryErr = allocator.SetAgentThread(ctx, user.ID, agentName, resultThreadID)
+		}
+		if registryErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store agent thread: " + registryErr.Error()})
+			return
+		}
 	}
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error(), "agent_name": agentName})

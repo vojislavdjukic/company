@@ -36,6 +36,12 @@ type AuthRepository interface {
 	FindUserByEmail(context.Context, string) (int64, string, string, string, error)
 }
 
+// UserEmailLookup loads the current account email for a verified token's user ID.
+// ctx bounds the query; userID is the JWT subject.
+type UserEmailLookup interface {
+	FindUserEmailByID(context.Context, int64) (string, error)
+}
+
 // AuthService handles account creation, password verification, and bearer-token validation.
 type AuthService struct {
 	repository AuthRepository
@@ -95,9 +101,9 @@ func (s *AuthService) Login(ctx context.Context, email, password string) (User, 
 	return user, token, err
 }
 
-// Authenticate verifies a signed, unexpired JWT and returns its account claims.
-// ctx is accepted for API interface compatibility; token is the raw bearer JWT.
-func (s *AuthService) Authenticate(_ context.Context, token string) (User, error) {
+// Authenticate verifies a signed, unexpired JWT and returns its account identity.
+// ctx bounds the optional email lookup; token is the raw bearer JWT.
+func (s *AuthService) Authenticate(ctx context.Context, token string) (User, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
 		return User{}, ErrInvalidToken
@@ -120,31 +126,41 @@ func (s *AuthService) Authenticate(_ context.Context, token string) (User, error
 		return User{}, ErrInvalidToken
 	}
 	var claims jwtClaims
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Issuer != "company-backend" || claims.ExpiresAt <= time.Now().Unix() || claims.IssuedAt > time.Now().Add(time.Minute).Unix() || claims.Email == "" || !validRole(claims.Role) {
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Issuer != "company-backend" || claims.ExpiresAt <= time.Now().Unix() || claims.IssuedAt > time.Now().Add(time.Minute).Unix() || !validRole(claims.Role) {
 		return User{}, ErrInvalidToken
 	}
 	userID, err := strconv.ParseInt(claims.Subject, 10, 64)
 	if err != nil || userID <= 0 {
 		return User{}, ErrInvalidToken
 	}
-	return User{ID: userID, Email: claims.Email, Role: claims.Role}, nil
+	user := User{ID: userID, Role: claims.Role}
+	if emailLookup, ok := s.repository.(UserEmailLookup); ok {
+		email, err := emailLookup.FindUserEmailByID(ctx, userID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrInvalidToken
+		}
+		if err != nil {
+			return User{}, err
+		}
+		user.Email = email
+	}
+	return user, nil
 }
 
 type jwtClaims struct {
 	Subject   string `json:"sub"`
-	Email     string `json:"email"`
 	Role      string `json:"role"`
 	Issuer    string `json:"iss"`
 	IssuedAt  int64  `json:"iat"`
 	ExpiresAt int64  `json:"exp"`
 }
 
-// createToken signs a seven-day HS256 JWT containing the user ID, email, and role.
-// user is the account whose identity and role become the token claims.
+// createToken signs a seven-day HS256 JWT containing the user ID and role.
+// user supplies the ID and role encoded in the token claims.
 func (s *AuthService) createToken(user User) (string, error) {
 	now := time.Now()
 	claims := jwtClaims{
-		Subject: strconv.FormatInt(user.ID, 10), Email: user.Email, Role: user.Role,
+		Subject: strconv.FormatInt(user.ID, 10), Role: user.Role,
 		Issuer: "company-backend", IssuedAt: now.Unix(), ExpiresAt: now.Add(7 * 24 * time.Hour).Unix(),
 	}
 	header, err := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})

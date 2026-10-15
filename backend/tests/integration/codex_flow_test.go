@@ -8,12 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"strconv"
 	"testing"
 	"time"
 
@@ -28,9 +26,8 @@ import (
 const defaultIntegrationDatabaseURL = "postgres://company:company@localhost:5432/thecompany?sslmode=disable"
 
 // TestRegistrationLoginAndCodexConversation exercises account creation, login,
-// two authenticated turns on one Codex thread, and orderly server shutdown.
-// t provides test configuration and reports failures; database URL overrides are optional,
-// and Codex must be installed and authenticated for the current OS user.
+// explicit container-backed agent creation, two turns on its thread, and cleanup.
+// t provides test configuration and reports failures; database URL overrides are optional.
 func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	databaseURL := isolatedDatabaseURL(t)
 	db, err := repository.OpenPostgres(databaseURL)
@@ -43,15 +40,27 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create authentication service: %v", err)
 	}
-	listenURL := freeCodexListenURL(t)
-	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"), listenURL)
-	defer func() {
-		if err := codexClient.Close(); err != nil {
-			t.Errorf("close Codex app-server: %v", err)
+	t.Setenv("CODEX_AGENT_DATA_DIR", t.TempDir())
+	codexManager, err := codex.NewPodmanManager(os.Getenv("CODEX_PODMAN_IMAGE"))
+	if err != nil {
+		t.Fatalf("create Podman Codex manager: %v", err)
+	}
+	var ownerID int64
+	var agentName string
+	t.Cleanup(func() {
+		if ownerID != 0 && agentName != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			if err := codexManager.RemoveAgent(cleanupCtx, ownerID, agentName); err != nil {
+				t.Errorf("remove test agent container: %v", err)
+			}
+			cancel()
 		}
-	}()
+		if err := codexManager.Close(); err != nil {
+			t.Errorf("close Podman Codex manager: %v", err)
+		}
+	})
 
-	handler := api.NewHandlerWithServices(service.NewHealthService(db), codexClient, db, auth)
+	handler := api.NewHandlerWithServices(service.NewHealthService(db), codexManager, db, auth)
 	server := httptest.NewServer(handler)
 	defer server.Close()
 	client := &http.Client{Timeout: 90 * time.Second}
@@ -91,6 +100,21 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	if login.User.ID != registration.User.ID || login.User.Role != "user" || login.Token == "" {
 		t.Fatalf("login returned unexpected account or token: %+v", login.User)
 	}
+	ownerID = login.User.ID
+
+	var createdAgent struct {
+		AgentName     string `json:"agent_name"`
+		ThreadID      string `json:"thread_id"`
+		ContainerName string `json:"container_name"`
+	}
+	t.Log("creating a container-backed Codex agent")
+	if status := postJSON(t, client, server.URL+"/codex/agents", map[string]string{}, login.Token, &createdAgent); status != http.StatusCreated {
+		t.Fatalf("agent creation status = %d, want %d", status, http.StatusCreated)
+	}
+	agentName = createdAgent.AgentName
+	if len(agentName) != 3 || createdAgent.ThreadID == "" || createdAgent.ContainerName == "" {
+		t.Fatalf("agent creation returned incomplete identifiers: %+v", createdAgent)
+	}
 
 	var firstMessage struct {
 		Response string `json:"response"`
@@ -98,7 +122,7 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	}
 	t.Log("sending first message to Codex app-server")
 	if status := postJSON(t, client, server.URL+"/codex/messages", map[string]string{
-		"message": "Reply with exactly READY. Do not use tools.",
+		"message": "Reply with exactly READY. Do not use tools.", "agent_name": agentName,
 	}, login.Token, &firstMessage); status != http.StatusOK {
 		t.Fatalf("first Codex message status = %d, want %d", status, http.StatusOK)
 	}
@@ -120,12 +144,23 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 		t.Fatalf("second message did not continue the first agent: %+v", secondMessage)
 	}
 
-	server.Close()
-	t.Log("closing Codex app-server")
-	if err := codexClient.Close(); err != nil {
-		t.Fatalf("close Codex app-server after both turns: %v", err)
+	if firstMessage.Agent != agentName {
+		t.Fatalf("message used agent %q, want %q", firstMessage.Agent, agentName)
 	}
-	t.Log("Codex app-server closed")
+	removeRequest, err := http.NewRequest(http.MethodDelete, server.URL+"/codex/agents/"+agentName, nil)
+	if err != nil {
+		t.Fatalf("create agent cleanup request: %v", err)
+	}
+	removeRequest.Header.Set("Authorization", "Bearer "+login.Token)
+	removeResponse, err := client.Do(removeRequest)
+	if err != nil {
+		t.Fatalf("delete test agent: %v", err)
+	}
+	removeResponse.Body.Close()
+	if removeResponse.StatusCode != http.StatusNoContent {
+		t.Fatalf("agent deletion status = %d, want %d", removeResponse.StatusCode, http.StatusNoContent)
+	}
+	agentName = ""
 }
 
 // isolatedDatabaseURL creates an empty schema for the integration test and
@@ -178,21 +213,6 @@ func isolatedDatabaseURL(t *testing.T) string {
 	query.Set("search_path", schema)
 	parsedURL.RawQuery = query.Encode()
 	return parsedURL.String()
-}
-
-// freeCodexListenURL reserves an available local TCP port long enough to select
-// an app-server WebSocket address. t reports socket allocation failures.
-func freeCodexListenURL(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve Codex app-server port: %v", err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release temporary Codex port: %v", err)
-	}
-	return "ws://127.0.0.1:" + strconv.Itoa(port)
 }
 
 // postJSON sends value as JSON with an optional bearer token, checks transport

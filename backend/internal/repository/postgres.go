@@ -72,6 +72,17 @@ func (p *Postgres) FindUserByEmail(ctx context.Context, email string) (int64, st
 	return user.ID, user.Email, user.Role, passwordHash, err
 }
 
+// FindUserEmailByID returns the current email for a verified account ID. ctx
+// bounds the query; userID is the account identifier from the JWT subject.
+func (p *Postgres) FindUserEmailByID(ctx context.Context, userID int64) (string, error) {
+	if err := p.ensureAuthTables(ctx); err != nil {
+		return "", err
+	}
+	var email string
+	err := p.db.QueryRowContext(ctx, `SELECT email FROM app_users WHERE id = $1`, userID).Scan(&email)
+	return email, err
+}
+
 // ensureAuthTables creates or upgrades the account table once per repository instance.
 // ctx bounds the DDL operation; the mutex prevents concurrent first-use creation attempts.
 func (p *Postgres) ensureAuthTables(ctx context.Context) error {
@@ -105,12 +116,107 @@ func (p *Postgres) LookupAgentThread(ctx context.Context, userID int64, agentNam
 	if err := p.ensureAgentThreadTable(ctx); err != nil {
 		return "", err
 	}
-	var threadID string
+	var threadID sql.NullString
 	err := p.db.QueryRowContext(ctx, `SELECT thread_id FROM codex_agent_threads WHERE user_id = $1 AND agent_name = $2`, userID, agentName).Scan(&threadID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
-	return threadID, err
+	return threadID.String, err
+}
+
+// HasAgent reports whether agentName belongs to userID, including an agent
+// whose thread has not started yet. ctx bounds the ownership query.
+func (p *Postgres) HasAgent(ctx context.Context, userID int64, agentName string) (bool, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return false, err
+	}
+	var exists bool
+	err := p.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM codex_agent_threads WHERE user_id = $1 AND agent_name = $2)`, userID, agentName).Scan(&exists)
+	return exists, err
+}
+
+// DeleteAgent removes one user's persisted name-to-thread mapping. ctx bounds
+// the delete; userID scopes ownership and agentName identifies the mapping.
+func (p *Postgres) DeleteAgent(ctx context.Context, userID int64, agentName string) (bool, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return false, err
+	}
+	result, err := p.db.ExecContext(ctx, `DELETE FROM codex_agent_threads WHERE user_id = $1 AND agent_name = $2`, userID, agentName)
+	if err != nil {
+		return false, err
+	}
+	deleted, err := result.RowsAffected()
+	return deleted > 0, err
+}
+
+// ReserveAgentName allocates a unique three-letter name before creating a
+// Codex runtime. ctx bounds each insert; userID owns the reserved mapping.
+func (p *Postgres) ReserveAgentName(ctx context.Context, userID int64) (string, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return "", err
+	}
+	for attempt := 0; attempt < 64; attempt++ {
+		name, err := generateAgentName()
+		if err != nil {
+			return "", err
+		}
+		var storedName string
+		err = p.db.QueryRowContext(ctx, `
+			INSERT INTO codex_agent_threads (agent_name, thread_id, user_id)
+			VALUES ($1, NULL, $2) ON CONFLICT DO NOTHING RETURNING agent_name`, name, userID).Scan(&storedName)
+		if err == nil {
+			return storedName, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+	}
+	return "", errors.New("could not reserve a unique agent name after 64 attempts")
+}
+
+// SetAgentThread attaches Codex's first thread ID to a reserved name. ctx
+// bounds the update; userID and agentName identify the owned reservation.
+func (p *Postgres) SetAgentThread(ctx context.Context, userID int64, agentName, threadID string) error {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return err
+	}
+	result, err := p.db.ExecContext(ctx, `
+		UPDATE codex_agent_threads SET thread_id = $3
+		WHERE user_id = $1 AND agent_name = $2 AND (thread_id IS NULL OR thread_id = $3)`, userID, agentName, threadID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return errors.New("reserved agent name was not found or already has another thread")
+	}
+	return nil
+}
+
+// ReplaceAgentThreadID changes a stale Codex thread ID while keeping its agent
+// name and container association. ctx bounds the update; userID and agentName
+// identify the mapping; oldThreadID protects concurrent replacements; newThreadID is the replacement.
+func (p *Postgres) ReplaceAgentThreadID(ctx context.Context, userID int64, agentName, oldThreadID, newThreadID string) error {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return err
+	}
+	result, err := p.db.ExecContext(ctx, `
+		UPDATE codex_agent_threads SET thread_id = $4
+		WHERE user_id = $1 AND agent_name = $2 AND thread_id = $3`, userID, agentName, oldThreadID, newThreadID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if updated == 0 {
+		return errors.New("agent thread changed before stale thread could be replaced")
+	}
+	return nil
 }
 
 // CreateAgentThread assigns a unique generated three-letter name to threadID.
@@ -218,6 +324,9 @@ func (p *Postgres) ensureAgentThreadTable(ctx context.Context) error {
 		)`)
 	if err == nil {
 		_, err = p.db.ExecContext(ctx, `ALTER TABLE codex_agent_threads ADD COLUMN IF NOT EXISTS user_id BIGINT REFERENCES app_users(id) ON DELETE CASCADE`)
+	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `ALTER TABLE codex_agent_threads ALTER COLUMN thread_id DROP NOT NULL`)
 	}
 	if err != nil {
 		return fmt.Errorf("create Codex agent mapping table: %w", err)

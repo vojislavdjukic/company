@@ -20,13 +20,13 @@ import (
 // that app-server can no longer resume.
 var ErrThreadNotFound = errors.New("Codex thread not found")
 
-// Client owns one Codex app-server process and its persistent WebSocket
-// connection. Calls are serialized so each HTTP request can collect its own
-// response events without mixing them with another turn.
+// Client owns a Codex app-server WebSocket and optionally its local process.
+// Calls are serialized so response events from concurrent turns do not mix.
 type Client struct {
 	mu          sync.Mutex
 	command     string
 	listenURL   string
+	wsToken     string
 	cmd         *exec.Cmd
 	conn        *websocket.Conn
 	processDone chan struct{}
@@ -35,6 +35,24 @@ type Client struct {
 	started     bool
 	pending     [][]byte
 	threads     map[string]struct{}
+	external    bool
+}
+
+// NewRemoteClient creates a client that connects to an already running Codex
+// app-server. listenURL is the server's WebSocket address; the remote process
+// is managed by the container manager rather than this client.
+func NewRemoteClient(listenURL string) *Client {
+	return NewRemoteClientWithToken(listenURL, "")
+}
+
+// NewRemoteClientWithToken creates a client for a remote app-server using its
+// capability token. listenURL is the server's WebSocket address; wsToken is
+// the separate transport credential required by an authenticated listener.
+func NewRemoteClientWithToken(listenURL, wsToken string) *Client {
+	if listenURL == "" {
+		listenURL = "ws://127.0.0.1:8765"
+	}
+	return &Client{listenURL: listenURL, wsToken: wsToken, threads: make(map[string]struct{}), external: true}
 }
 
 // NewClient creates a Codex client that launches app-server and connects to its
@@ -66,17 +84,8 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 	if err := c.start(ctx); err != nil {
 		return "", "", err
 	}
-	if !c.started {
-		// The app-server protocol requires one initialize handshake per process.
-		if _, err := c.request(ctx, "initialize", map[string]any{"clientInfo": map[string]string{
-			"name": "company_backend", "title": "Company Backend", "version": "1.0.0",
-		}}); err != nil {
-			return "", "", fmt.Errorf("initialize Codex: %w", err)
-		}
-		if err := c.notify("initialized", map[string]any{}); err != nil {
-			return "", "", err
-		}
-		c.started = true
+	if err := c.initialize(ctx); err != nil {
+		return "", "", err
 	}
 
 	var thread map[string]json.RawMessage
@@ -171,6 +180,49 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 	}
 }
 
+// StartThread initializes app-server if needed and creates a conversation
+// without sending a user turn. ctx bounds startup and the JSON-RPC requests.
+func (c *Client) StartThread(ctx context.Context) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.start(ctx); err != nil {
+		return "", err
+	}
+	if err := c.initialize(ctx); err != nil {
+		return "", err
+	}
+	thread, err := c.request(ctx, "thread/start", map[string]any{})
+	if err != nil {
+		return "", fmt.Errorf("start Codex thread: %w", err)
+	}
+	var info struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(thread["thread"], &info); err != nil || info.ID == "" {
+		return "", errors.New("Codex returned no thread ID")
+	}
+	c.threads[info.ID] = struct{}{}
+	return info.ID, nil
+}
+
+// initialize performs app-server's one-time client handshake. ctx bounds the
+// JSON-RPC request; the Client lock must be held by the caller.
+func (c *Client) initialize(ctx context.Context) error {
+	if c.started {
+		return nil
+	}
+	if _, err := c.request(ctx, "initialize", map[string]any{"clientInfo": map[string]string{
+		"name": "company_backend", "title": "Company Backend", "version": "1.0.0",
+	}}); err != nil {
+		return fmt.Errorf("initialize Codex: %w", err)
+	}
+	if err := c.notify("initialized", map[string]any{}); err != nil {
+		return err
+	}
+	c.started = true
+	return nil
+}
+
 // isMissingThreadError recognizes app-server resume errors that mean the
 // persisted thread is gone. err is the JSON-RPC error returned by app-server.
 func isMissingThreadError(err error) bool {
@@ -184,6 +236,9 @@ func isMissingThreadError(err error) bool {
 func (c *Client) start(ctx context.Context) error {
 	if c.conn != nil {
 		return nil
+	}
+	if c.external {
+		return c.connect(ctx)
 	}
 	c.cmd = exec.Command(c.command, "app-server", "--listen", c.listenURL)
 	configureCommandProcessGroup(c.cmd)
@@ -203,13 +258,23 @@ func (c *Client) start(ctx context.Context) error {
 		close(c.processDone)
 	}()
 
+	return c.connect(ctx)
+}
+
+// connect opens the WebSocket to app-server and retries until it is ready.
+// ctx bounds retries and listenURL is the app-server WebSocket endpoint.
+func (c *Client) connect(ctx context.Context) error {
 	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var lastErr error
 	for {
 		// The process may need a short time to bind the port after Start returns.
-		conn, _, err := dialer.DialContext(ctx, c.listenURL, http.Header{})
+		headers := http.Header{}
+		if c.wsToken != "" {
+			headers.Set("Authorization", "Bearer "+c.wsToken)
+		}
+		conn, _, err := dialer.DialContext(ctx, c.listenURL, headers)
 		if err == nil {
 			c.conn = conn
 			return nil
@@ -219,7 +284,9 @@ func (c *Client) start(ctx context.Context) error {
 		case <-ctx.Done():
 			return fmt.Errorf("connect to Codex app-server at %s: %w", c.listenURL, ctx.Err())
 		case <-c.processDone:
-			return fmt.Errorf("Codex app-server exited before WebSocket connection: %v (last dial error: %v)", c.processErr, lastErr)
+			if c.processDone != nil {
+				return fmt.Errorf("Codex app-server exited before WebSocket connection: %v (last dial error: %v)", c.processErr, lastErr)
+			}
 		case <-ticker.C:
 		}
 	}

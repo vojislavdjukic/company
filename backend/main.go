@@ -38,15 +38,22 @@ func main() {
 		}
 	}
 
-	// Keep one Codex client for the server lifetime so app-server remains alive
-	// across HTTP requests and can resume threads by their returned IDs.
-	codexClient := codex.NewClient(os.Getenv("CODEX_BIN"), os.Getenv("CODEX_APP_SERVER_LISTEN"))
-	defer codexClient.Close()
+	// Keep one container manager for the server lifetime. It starts one Codex
+	// app-server container per named agent and stops opened containers on exit.
+	codexManager, err := codex.NewPodmanManager(os.Getenv("CODEX_PODMAN_IMAGE"))
+	if err != nil {
+		log.Fatalf("configure Podman Codex manager: %v", err)
+	}
+	defer func() {
+		if err := codexManager.Close(); err != nil {
+			log.Printf("close Podman Codex containers: %v", err)
+		}
+	}()
 	authService, err := service.NewAuthService(db, os.Getenv("JWT_SECRET"))
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := api.NewHandlerWithServices(service.NewHealthService(db), codexClient, db, authService)
+	app := api.NewHandlerWithServices(service.NewHealthService(db), codexManager, db, authService)
 	server := &http.Server{
 		Addr:              ":" + strconv.Itoa(port),
 		Handler:           loggingMiddleware(app),
