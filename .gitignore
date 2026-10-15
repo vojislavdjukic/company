@@ -31,6 +31,8 @@ go.work.sum
 # Build artifacts
 build/
 backend/build/
+frontend/node_modules/
+frontend/dist/
 
 # Editor/IDE
 # .idea/
