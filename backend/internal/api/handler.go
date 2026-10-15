@@ -22,22 +22,30 @@ type HealthService interface {
 // and agent name. userID and agentName select the runtime; message and threadID
 // identify the requested Codex turn.
 type AgentCodexService interface {
-	SendAgent(context.Context, int64, string, string, string) (string, string, error)
+	SendAgent(context.Context, int64, string, string, string, string) (string, string, error)
 }
 
 // AgentCreator starts a user's isolated container and creates its first thread.
 // ctx bounds the operation; userID owns the agent and agentName identifies it.
 type AgentCreator interface {
-	CreateAgent(context.Context, int64, string) (string, string, error)
+	CreateAgent(context.Context, int64, string, string) (string, string, error)
 }
 
-// AgentNameAllocator reserves a generated agent name before its runtime starts
-// and saves the first thread ID afterward. ctx bounds the database work; userID
-// owns the generated name; threadID is returned by Codex.
+// AgentNameAllocator reserves an internal alias with optional user-facing
+// metadata and saves the first thread ID. ctx bounds database work; userID
+// owns the alias; threadID is returned by Codex.
 type AgentNameAllocator interface {
 	ReserveAgentName(context.Context, int64) (string, error)
+	ReserveNamedAgent(context.Context, int64, string, string) (string, error)
 	SetAgentThread(context.Context, int64, string, string) error
 	ReplaceAgentThreadID(context.Context, int64, string, string, string) error
+}
+
+// AgentMetadataRegistry loads the user-provided label and developer instructions.
+// ctx bounds database work; userID scopes ownership and agentName is the short ID.
+type AgentMetadataRegistry interface {
+	LookupAgentMetadata(context.Context, int64, string) (service.AgentProfile, error)
+	ListAgentMetadata(context.Context, int64, bool) ([]service.AgentProfile, error)
 }
 
 // AgentLifecycleRegistry checks ownership and removes an agent's saved mapping.
@@ -119,8 +127,8 @@ func NewHandlerWithServices(health HealthService, codexClient any, agents AgentR
 }
 
 // Path: POST /codex/agents
-// createCodexAgent reserves a short name, starts its container, and creates
-// the initial Codex thread. w receives the identifiers; r supplies the bearer token.
+// createCodexAgent reserves an alias and profile, starts its container, and
+// creates the initial instructed thread. w receives identifiers; r has the profile and token.
 func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
 	user, ok := h.authenticatedUser(w, r)
 	if !ok {
@@ -128,6 +136,22 @@ func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if user.Role != "user" && user.Role != "admin" {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "role cannot create Codex agents"})
+		return
+	}
+	var request createCodexAgentRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide a name and description"})
+		return
+	}
+	request.Name = strings.TrimSpace(request.Name)
+	request.Description = strings.TrimSpace(request.Description)
+	if request.Name == "" || len([]rune(request.Name)) > 64 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name must contain between 1 and 64 characters"})
+		return
+	}
+	if request.Description == "" || len([]rune(request.Description)) > 4000 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "description must contain between 1 and 4000 characters"})
 		return
 	}
 	allocator, ok := h.agents.(AgentNameAllocator)
@@ -152,8 +176,12 @@ func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	agentName, err := allocator.ReserveAgentName(ctx, user.ID)
+	agentName, err := allocator.ReserveNamedAgent(ctx, user.ID, request.Name, request.Description)
 	if err != nil {
+		if errors.Is(err, service.ErrAgentNameTaken) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "an agent with this name already exists"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "reserve agent name: " + err.Error()})
 		return
 	}
@@ -170,7 +198,7 @@ func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		return errors.Join(removeErr, deleteErr)
 	}
-	threadID, containerName, err := creator.CreateAgent(ctx, user.ID, agentName)
+	threadID, containerName, err := creator.CreateAgent(ctx, user.ID, agentName, request.Description)
 	if err != nil {
 		rollbackErr := rollback()
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": errors.Join(fmt.Errorf("create container-backed agent: %w", err), rollbackErr).Error()})
@@ -182,8 +210,14 @@ func (h *Handler) createCodexAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"agent_name": agentName, "thread_id": threadID, "container_name": containerName,
+		"agent_name": agentName, "name": request.Name, "description": request.Description,
+		"thread_id": threadID, "container_name": containerName,
 	})
+}
+
+type createCodexAgentRequest struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // Path: GET /codex/agents
@@ -209,6 +243,22 @@ func (h *Handler) listCodexAgents(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list Codex containers: " + err.Error()})
 		return
+	}
+	if metadata, ok := h.agents.(AgentMetadataRegistry); ok {
+		profiles, err := metadata.ListAgentMetadata(ctx, user.ID, user.Role == "admin")
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list agent profiles: " + err.Error()})
+			return
+		}
+		byAgent := make(map[string]service.AgentProfile, len(profiles))
+		for _, profile := range profiles {
+			byAgent[profile.AgentName] = profile
+		}
+		for i := range containers {
+			profile := byAgent[containers[i].AgentName]
+			containers[i].DisplayName = profile.Name
+			containers[i].Description = profile.Description
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"containers": containers})
 }
@@ -307,12 +357,21 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
 	threadID := ""
+	developerInstructions := ""
 	if agentName != "" {
 		var err error
 		threadID, err = h.agents.LookupAgentThread(ctx, user.ID, agentName)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent name: " + err.Error()})
 			return
+		}
+		if metadata, ok := h.agents.(AgentMetadataRegistry); ok {
+			profile, profileErr := metadata.LookupAgentMetadata(ctx, user.ID, agentName)
+			if profileErr != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "look up agent profile: " + profileErr.Error()})
+				return
+			}
+			developerInstructions = profile.Description
 		}
 	}
 	managedCodex, isManaged := h.codex.(AgentCodexService)
@@ -336,11 +395,11 @@ func (h *Handler) sendCodexMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	needsThreadSave := threadID == ""
 	staleThreadID := ""
-	response, resultThreadID, err := managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, threadID)
+	response, resultThreadID, err := managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, threadID, developerInstructions)
 	if errors.Is(err, codex.ErrThreadNotFound) && agentName != "" {
 		needsThreadSave = true
 		staleThreadID = threadID
-		response, resultThreadID, err = managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, "")
+		response, resultThreadID, err = managedCodex.SendAgent(ctx, user.ID, agentName, request.Message, "", developerInstructions)
 	}
 	if resultThreadID != "" && needsThreadSave {
 		var registryErr error

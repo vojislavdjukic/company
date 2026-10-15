@@ -46,12 +46,14 @@ type managedAgent struct {
 // app-managed Codex container. ID and name identify it; owner and agent name
 // describe its association; status and createdAt describe its Podman state.
 type ContainerInfo struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	AgentName string `json:"agent_name"`
-	OwnerID   int64  `json:"owner_id"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
+	Description string `json:"description,omitempty"`
+	AgentName   string `json:"agent_name"`
+	OwnerID     int64  `json:"owner_id"`
+	Status      string `json:"status"`
+	CreatedAt   string `json:"created_at"`
 }
 
 // podmanContainer is the subset of Podman's JSON list output used to build
@@ -101,15 +103,15 @@ func NewPodmanManager(image string) (*PodmanManager, error) {
 	}, nil
 }
 
-// SendAgent sends one prompt to the app-server container assigned to a user and
-// agent name. ctx bounds startup and the Codex turn; userID and agentName choose
-// the isolated container; message and threadID identify the requested turn.
-func (m *PodmanManager) SendAgent(ctx context.Context, userID int64, agentName, message, threadID string) (string, string, error) {
+// SendAgent sends a prompt to an agent's container. ctx bounds startup and the
+// turn; userID and agentName select the container; message and threadID select
+// the turn; developerInstructions seed a replacement thread if history is gone.
+func (m *PodmanManager) SendAgent(ctx context.Context, userID int64, agentName, message, threadID, developerInstructions string) (string, string, error) {
 	agent, err := m.ensureAgent(ctx, userID, agentName)
 	if err != nil {
 		return "", "", err
 	}
-	return agent.client.Send(ctx, message, threadID)
+	return agent.client.Send(ctx, message, threadID, developerInstructions)
 }
 
 // EnsureAgent creates and connects an agent's container without sending a
@@ -120,13 +122,14 @@ func (m *PodmanManager) EnsureAgent(ctx context.Context, userID int64, agentName
 }
 
 // CreateAgent starts the user's container and creates its first Codex thread.
-// ctx bounds startup and thread creation; userID and agentName identify it.
-func (m *PodmanManager) CreateAgent(ctx context.Context, userID int64, agentName string) (string, string, error) {
+// ctx bounds startup; userID and agentName identify it; developerInstructions
+// become the app-server's developer instructions for that thread.
+func (m *PodmanManager) CreateAgent(ctx context.Context, userID int64, agentName, developerInstructions string) (string, string, error) {
 	agent, err := m.ensureAgent(ctx, userID, agentName)
 	if err != nil {
 		return "", "", err
 	}
-	threadID, err := agent.client.StartThread(ctx)
+	threadID, err := agent.client.StartThread(ctx, developerInstructions)
 	if err != nil {
 		return "", agent.name, err
 	}

@@ -12,7 +12,7 @@ By default, the app connects to the local `thecompany` database as `company` (`c
 
 ## Endpoints
 
-- `GET /` — service status
+- `GET /` — Vue frontend in production
 - `GET /healthz` — process liveness check
 - `GET /readyz` — PostgreSQL readiness check
 - `POST /auth/register` — create an account and return a bearer token
@@ -40,14 +40,17 @@ curl -X POST http://localhost:4000/auth/register \
   -d '{"email":"person@example.com","password":"a-long-password"}'
 ```
 
-Create an agent before sending messages when you want its name and container
-up front. The response includes the generated three-letter name, Codex thread
-ID, and Podman container name. The thread ID is managed by the server; use the
-agent name in message requests.
+Create an agent before sending messages to assign it a display name and
+description. The description becomes the thread's Codex developer
+instructions. The response also includes a generated three-letter `agent_name`
+used internally for follow-up messages, plus its thread and container IDs.
+Display names are unique per account.
 
 ```sh
 curl -X POST http://localhost:4000/codex/agents \
-  -H 'Authorization: Bearer <token>'
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"Product researcher","description":"Research product ideas, compare evidence, and summarize findings clearly."}'
 ```
 
 The Codex message endpoint accepts `{"message":"..."}` and returns the
@@ -90,9 +93,10 @@ curl http://localhost:4000/codex/agents \
   -H 'Authorization: Bearer <token>'
 ```
 
-The response contains each visible container's ID, name, agent name, owner ID,
-status, and creation time. Regular users only receive their own containers;
-admins receive all app-managed Codex containers.
+The response contains each visible container's ID, container name, display name,
+description, internal agent name, owner ID, status, and creation time. Regular
+users only receive their own containers; admins receive all app-managed Codex
+containers.
 
 The backend starts one Podman container for each `(user_id, agent_name)` when
 the agent is created or first receives a message. Each container runs `codex app-server` and exposes its

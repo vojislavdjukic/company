@@ -73,10 +73,10 @@ func NewClient(command, listenURL string) *Client {
 	}
 }
 
-// Send submits one user message and waits for the completed agent response.
-// ctx bounds the operation, message is the user's prompt, and threadID selects
-// the conversation: empty starts a new thread; a supplied ID resumes one.
-func (c *Client) Send(ctx context.Context, message, threadID string) (string, string, error) {
+// Send submits a prompt and waits for the completed response. ctx bounds the
+// operation; message is the prompt; threadID selects the conversation; and
+// developerInstructions apply when this call must start a fresh thread.
+func (c *Client) Send(ctx context.Context, message, threadID, developerInstructions string) (string, string, error) {
 	// Only one turn may read this shared WebSocket at a time; concurrent HTTP
 	// requests wait here until the current Codex turn has completed.
 	c.mu.Lock()
@@ -93,7 +93,11 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 	if threadID == "" {
 		// A missing ID represents a new chat, while a supplied ID reconnects the
 		// caller to existing Codex history.
-		thread, err = c.request(ctx, "thread/start", map[string]any{})
+		params := map[string]any{}
+		if developerInstructions != "" {
+			params["developerInstructions"] = developerInstructions
+		}
+		thread, err = c.request(ctx, "thread/start", params)
 	} else {
 		thread, err = c.request(ctx, "thread/resume", map[string]any{"threadId": threadID})
 	}
@@ -180,9 +184,9 @@ func (c *Client) Send(ctx context.Context, message, threadID string) (string, st
 	}
 }
 
-// StartThread initializes app-server if needed and creates a conversation
-// without sending a user turn. ctx bounds startup and the JSON-RPC requests.
-func (c *Client) StartThread(ctx context.Context) (string, error) {
+// StartThread initializes app-server and creates a conversation without a user
+// turn. ctx bounds startup and requests; developerInstructions seed the thread.
+func (c *Client) StartThread(ctx context.Context, developerInstructions string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err := c.start(ctx); err != nil {
@@ -191,7 +195,11 @@ func (c *Client) StartThread(ctx context.Context) (string, error) {
 	if err := c.initialize(ctx); err != nil {
 		return "", err
 	}
-	thread, err := c.request(ctx, "thread/start", map[string]any{})
+	params := map[string]any{}
+	if developerInstructions != "" {
+		params["developerInstructions"] = developerInstructions
+	}
+	thread, err := c.request(ctx, "thread/start", params)
 	if err != nil {
 		return "", fmt.Errorf("start Codex thread: %w", err)
 	}

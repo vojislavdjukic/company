@@ -9,6 +9,8 @@ import (
 	"math/big"
 	"sync"
 
+	"company/backend/internal/service"
+
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -174,6 +176,84 @@ func (p *Postgres) ReserveAgentName(ctx context.Context, userID int64) (string, 
 	return "", errors.New("could not reserve a unique agent name after 64 attempts")
 }
 
+// ReserveNamedAgent allocates an internal alias and stores the display name and
+// developer instructions. ctx bounds database work; userID owns the agent;
+// name is user-facing and instructions seed its Codex thread.
+func (p *Postgres) ReserveNamedAgent(ctx context.Context, userID int64, name, instructions string) (string, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return "", err
+	}
+	for attempt := 0; attempt < 64; attempt++ {
+		alias, err := generateAgentName()
+		if err != nil {
+			return "", err
+		}
+		var storedName string
+		err = p.db.QueryRowContext(ctx, `
+			INSERT INTO codex_agent_threads (agent_name, thread_id, user_id, display_name, developer_instructions)
+			VALUES ($1, NULL, $2, $3, $4)
+			ON CONFLICT (agent_name) DO NOTHING RETURNING agent_name`, alias, userID, name, instructions).Scan(&storedName)
+		if err == nil {
+			return storedName, nil
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		var postgresErr *pgconn.PgError
+		if errors.As(err, &postgresErr) && postgresErr.ConstraintName == "codex_agent_threads_user_name_unique" {
+			return "", service.ErrAgentNameTaken
+		}
+		return "", err
+	}
+	return "", errors.New("could not reserve a unique internal agent alias after 64 attempts")
+}
+
+// LookupAgentMetadata returns the stored display name and instructions for an
+// owned agent. ctx bounds the query; userID scopes access and agentName is its alias.
+func (p *Postgres) LookupAgentMetadata(ctx context.Context, userID int64, agentName string) (service.AgentProfile, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return service.AgentProfile{}, err
+	}
+	var profile service.AgentProfile
+	profile.AgentName = agentName
+	err := p.db.QueryRowContext(ctx, `
+		SELECT display_name, developer_instructions FROM codex_agent_threads
+		WHERE user_id = $1 AND agent_name = $2`, userID, agentName).Scan(&profile.Name, &profile.Description)
+	if errors.Is(err, sql.ErrNoRows) {
+		return profile, nil
+	}
+	return profile, err
+}
+
+// ListAgentMetadata returns profile fields visible to an account. ctx bounds
+// the query; userID scopes regular users; isAdmin enables system-wide listing.
+func (p *Postgres) ListAgentMetadata(ctx context.Context, userID int64, isAdmin bool) ([]service.AgentProfile, error) {
+	if err := p.ensureAgentThreadTable(ctx); err != nil {
+		return nil, err
+	}
+	query := `SELECT agent_name, display_name, developer_instructions FROM codex_agent_threads`
+	args := []any{}
+	if !isAdmin {
+		query += ` WHERE user_id = $1`
+		args = append(args, userID)
+	}
+	query += ` ORDER BY created_at, agent_name`
+	rows, err := p.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	profiles := make([]service.AgentProfile, 0)
+	for rows.Next() {
+		var profile service.AgentProfile
+		if err := rows.Scan(&profile.AgentName, &profile.Name, &profile.Description); err != nil {
+			return nil, err
+		}
+		profiles = append(profiles, profile)
+	}
+	return profiles, rows.Err()
+}
+
 // SetAgentThread attaches Codex's first thread ID to a reserved name. ctx
 // bounds the update; userID and agentName identify the owned reservation.
 func (p *Postgres) SetAgentThread(ctx context.Context, userID int64, agentName, threadID string) error {
@@ -327,6 +407,15 @@ func (p *Postgres) ensureAgentThreadTable(ctx context.Context) error {
 	}
 	if err == nil {
 		_, err = p.db.ExecContext(ctx, `ALTER TABLE codex_agent_threads ALTER COLUMN thread_id DROP NOT NULL`)
+	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `ALTER TABLE codex_agent_threads ADD COLUMN IF NOT EXISTS display_name TEXT NOT NULL DEFAULT ''`)
+	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `ALTER TABLE codex_agent_threads ADD COLUMN IF NOT EXISTS developer_instructions TEXT NOT NULL DEFAULT ''`)
+	}
+	if err == nil {
+		_, err = p.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS codex_agent_threads_user_name_unique ON codex_agent_threads (user_id, lower(display_name)) WHERE display_name <> ''`)
 	}
 	if err != nil {
 		return fmt.Errorf("create Codex agent mapping table: %w", err)

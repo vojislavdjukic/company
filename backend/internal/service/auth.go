@@ -30,6 +30,14 @@ type User struct {
 	Role  string `json:"role"`
 }
 
+// AgentProfile stores the user-facing name and initial Codex instructions for
+// one agent. AgentName is the internal three-letter ID; Name is user supplied.
+type AgentProfile struct {
+	AgentName   string
+	Name        string
+	Description string
+}
+
 // AuthRepository stores account credentials and roles used to issue JWTs.
 type AuthRepository interface {
 	CreateUser(context.Context, string, string) (int64, string, error)

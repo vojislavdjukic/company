@@ -5,6 +5,7 @@ const token = ref(localStorage.getItem('thecompany-token') || '')
 const user = ref(null)
 const agents = ref([])
 const selectedAgent = ref('')
+const selectedAgentProfile = computed(() => agents.value.find((agent) => agent.agent_name === selectedAgent.value))
 const messages = ref([])
 const prompt = ref('')
 const email = ref('')
@@ -12,6 +13,9 @@ const password = ref('')
 const isRegistering = ref(false)
 const busy = ref(false)
 const error = ref('')
+const showAgentForm = ref(false)
+const newAgentName = ref('')
+const newAgentDescription = ref('')
 const authReady = computed(() => Boolean(token.value && user.value))
 
 /**
@@ -82,17 +86,23 @@ function signOut() {
 }
 
 /**
- * Creates a container-backed Codex agent and selects its generated name.
- * No parameters are required; the server allocates the agent name and thread.
+ * Creates a container-backed agent using the entered display name and description.
+ * No parameters are required; the server allocates an internal alias and thread.
  */
 async function createAgent() {
   busy.value = true
   error.value = ''
   try {
-    const result = await api('/codex/agents', { method: 'POST' })
+    const result = await api('/codex/agents', {
+      method: 'POST',
+      body: JSON.stringify({ name: newAgentName.value.trim(), description: newAgentDescription.value.trim() }),
+    })
     await loadWorkspace()
     selectedAgent.value = result.agent_name
     messages.value = []
+    showAgentForm.value = false
+    newAgentName.value = ''
+    newAgentDescription.value = ''
   } catch (requestError) {
     error.value = requestError.message
   } finally {
@@ -107,6 +117,10 @@ async function createAgent() {
 async function sendMessage() {
   const text = prompt.value.trim()
   if (!text || busy.value) return
+  if (!selectedAgent.value) {
+    showAgentForm.value = true
+    return
+  }
   const agentName = selectedAgent.value
   messages.value.push({ role: 'user', text })
   prompt.value = ''
@@ -177,12 +191,12 @@ onMounted(() => {
     <aside class="sidebar">
       <a class="brand" href="/"><span class="brand-mark">C</span> the company</a>
       <div class="side-label">WORKSPACE</div>
-      <button class="new-agent button" :disabled="busy" @click="createAgent"><span>＋</span> New agent</button>
+      <button class="new-agent button" :disabled="busy" @click="showAgentForm = true"><span>＋</span> New agent</button>
       <div class="side-label agents-label">YOUR AGENTS <span>{{ agents.length }}</span></div>
       <div class="agent-list">
         <button v-for="agent in agents" :key="agent.agent_name" class="agent-item" :class="{ active: selectedAgent === agent.agent_name }" @click="selectedAgent = agent.agent_name; messages = []; error = ''">
           <span class="agent-avatar">{{ agent.agent_name?.slice(0, 1).toUpperCase() }}</span>
-          <span class="agent-copy"><strong>Agent {{ agent.agent_name }}</strong><small>{{ agent.status }}</small></span>
+          <span class="agent-copy"><strong>{{ agent.display_name || `Agent ${agent.agent_name}` }}</strong><small>{{ agent.status }}</small></span>
           <span class="status-dot"></span>
         </button>
         <p v-if="!agents.length" class="empty-agents">Your agents will show up here.</p>
@@ -192,7 +206,7 @@ onMounted(() => {
 
     <section class="chat-area">
       <header class="topbar">
-        <div class="crumb"><span>Agents</span><b>/</b><strong>{{ selectedAgent ? `Agent ${selectedAgent}` : 'New conversation' }}</strong></div>
+        <div class="crumb"><span>Agents</span><b>/</b><strong>{{ selectedAgentProfile?.display_name || (selectedAgent ? `Agent ${selectedAgent}` : 'New conversation') }}</strong></div>
         <div class="top-actions"><span class="secure"><span></span> PRIVATE WORKSPACE</span><button v-if="selectedAgent" class="icon-button delete-button" title="Remove agent" :disabled="busy" @click="deleteAgent">⌫</button></div>
       </header>
 
@@ -200,25 +214,36 @@ onMounted(() => {
         <template v-if="messages.length">
           <div v-for="(message, index) in messages" :key="index" class="message-row" :class="message.role">
             <div class="message-avatar">{{ message.role === 'user' ? user.email?.slice(0, 1).toUpperCase() : 'C' }}</div>
-            <div class="message-body"><div class="message-author">{{ message.role === 'user' ? 'You' : `Agent ${selectedAgent}` }}</div><p>{{ message.text }}</p></div>
+            <div class="message-body"><div class="message-author">{{ message.role === 'user' ? 'You' : (selectedAgentProfile?.display_name || `Agent ${selectedAgent}`) }}</div><p>{{ message.text }}</p></div>
           </div>
           <div v-if="busy" class="thinking"><span></span><span></span><span></span> Thinking through it…</div>
         </template>
         <div v-else class="welcome">
           <div class="welcome-icon"><span>✳</span></div>
-          <div class="eyebrow">{{ selectedAgent ? `YOUR AGENT · ${selectedAgent.toUpperCase()}` : 'YOUR AI WORKSPACE' }}</div>
+          <div class="eyebrow">{{ selectedAgent ? (selectedAgentProfile?.display_name || `YOUR AGENT · ${selectedAgent.toUpperCase()}`) : 'YOUR AI WORKSPACE' }}</div>
           <h1>{{ selectedAgent ? 'What are we working on?' : 'Make room for a<br /><em>brilliant idea.</em>' }}</h1>
           <p>{{ selectedAgent ? 'Share a goal, ask a question, or give your agent a task.' : 'Start a conversation with an agent. It will have its own dedicated workspace.' }}</p>
-          <button v-if="!selectedAgent" class="button primary" :disabled="busy" @click="createAgent">＋ Create your first agent</button>
+          <button v-if="!selectedAgent" class="button primary" :disabled="busy" @click="showAgentForm = true">＋ Create your first agent</button>
           <div v-else class="suggestions"><button @click="prompt = 'Help me plan my next project'">✳ &nbsp; Help me plan a project</button><button @click="prompt = 'What can you help me with?'">↗ &nbsp; Explore what you can do</button></div>
         </div>
       </div>
 
       <div class="composer-wrap">
         <p v-if="error" class="error composer-error">{{ error }}</p>
-        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy" placeholder="Message your agent…" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || !prompt.trim()" aria-label="Send message">↑</button></div></form>
+        <form class="composer" @submit.prevent="sendMessage"><textarea v-model="prompt" :disabled="busy || !selectedAgent" :placeholder="selectedAgent ? 'Message your agent…' : 'Create an agent to start a conversation'" rows="1" @keydown.enter.exact.prevent="sendMessage"></textarea><div class="composer-foot"><span><kbd>↵</kbd> to send <span class="hint-separator">·</span> Your agent runs in its own container</span><button type="submit" class="send-button" :disabled="busy || !selectedAgent || !prompt.trim()" aria-label="Send message">↑</button></div></form>
         <div class="disclaimer">Codex can make mistakes. Review important work before you ship it.</div>
       </div>
     </section>
+
+    <div v-if="showAgentForm" class="modal-backdrop" @click.self="showAgentForm = false">
+      <form class="agent-form modal-card" @submit.prevent="createAgent">
+        <div class="modal-heading"><div><div class="eyebrow">A NEW TEAMMATE</div><h2>Create an agent</h2></div><button type="button" class="icon-button" aria-label="Close" @click="showAgentForm = false">×</button></div>
+        <p class="muted">Give your agent a name and describe the role you want it to take.</p>
+        <label>Agent name<input v-model="newAgentName" maxlength="64" placeholder="e.g. Product researcher" required /></label>
+        <label>Description<textarea v-model="newAgentDescription" maxlength="4000" rows="5" placeholder="Describe the agent's role, expertise, and how it should work." required></textarea><small>This becomes the agent's developer instructions.</small></label>
+        <p v-if="error" class="error">{{ error }}</p>
+        <div class="modal-actions"><button type="button" class="button" :disabled="busy" @click="showAgentForm = false">Cancel</button><button type="submit" class="button primary" :disabled="busy || !newAgentName.trim() || !newAgentDescription.trim()">{{ busy ? 'Creating…' : 'Create agent' }}</button></div>
+      </form>
+    </div>
   </main>
 </template>

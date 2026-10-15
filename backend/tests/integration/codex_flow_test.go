@@ -106,15 +106,20 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 
 	var createdAgent struct {
 		AgentName     string `json:"agent_name"`
+		Name          string `json:"name"`
+		Description   string `json:"description"`
 		ThreadID      string `json:"thread_id"`
 		ContainerName string `json:"container_name"`
 	}
 	t.Log("creating a container-backed Codex agent")
-	if status := postJSON(t, client, server.URL+"/codex/agents", map[string]string{}, login.Token, &createdAgent); status != http.StatusCreated {
+	if status := postJSON(t, client, server.URL+"/codex/agents", map[string]string{
+		"name": "Integration Agent", "description": "When asked for the developer instruction marker, reply with exactly AGENT_BRIEF_OK.",
+	}, login.Token, &createdAgent); status != http.StatusCreated {
 		t.Fatalf("agent creation status = %d, want %d", status, http.StatusCreated)
 	}
 	agentName = createdAgent.AgentName
-	if len(agentName) != 3 || createdAgent.ThreadID == "" || createdAgent.ContainerName == "" {
+	if len(agentName) != 3 || createdAgent.ThreadID == "" || createdAgent.ContainerName == "" ||
+		createdAgent.Name != "Integration Agent" || createdAgent.Description == "" {
 		t.Fatalf("agent creation returned incomplete identifiers: %+v", createdAgent)
 	}
 
@@ -125,7 +130,7 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 	}
 	t.Log("sending first message to Codex app-server")
 	if status := postJSON(t, client, server.URL+"/codex/messages", map[string]string{
-		"message": "Reply with exactly READY. Do not use tools.", "agent_name": agentName,
+		"message": "What is the developer instruction marker? Reply with exactly READY. Do not use tools.", "agent_name": agentName,
 	}, login.Token, &firstMessage); status != http.StatusOK {
 		podman := os.Getenv("PODMAN_BIN")
 		if podman == "" {
@@ -136,8 +141,8 @@ func TestRegistrationLoginAndCodexConversation(t *testing.T) {
 		cancel()
 		t.Fatalf("first Codex message status = %d, want %d (error %q; container logs error %v: %s)", status, http.StatusOK, firstMessage.Error, logsErr, strings.TrimSpace(string(logs)))
 	}
-	if firstMessage.Response == "" || len(firstMessage.Agent) != 3 {
-		t.Fatalf("first Codex response or agent name is empty: %+v", firstMessage)
+	if strings.TrimSpace(firstMessage.Response) != "AGENT_BRIEF_OK" || len(firstMessage.Agent) != 3 {
+		t.Fatalf("first Codex response did not follow developer instructions or agent name was invalid: %+v", firstMessage)
 	}
 
 	var secondMessage struct {
