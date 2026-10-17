@@ -30,6 +30,12 @@ func main() {
 		log.Fatalf("open PostgreSQL connection: %v", err)
 	}
 	defer db.Close()
+	databaseCtx, cancelDatabasePing := context.WithTimeout(context.Background(), 5*time.Second)
+	err = db.Ping(databaseCtx)
+	cancelDatabasePing()
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
+	}
 
 	port := 4000
 	if value := os.Getenv("PORT"); value != "" {
